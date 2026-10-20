@@ -11,7 +11,7 @@ pub mod render;
 pub mod spec;
 
 pub use palette::Palette;
-pub use render::{render_anim, render_frame, Frame, RenderOpts};
+pub use render::{hd_size_ok, render_anim, render_anim_hd, render_frame, render_frame_hd, Frame, HdFrame, RenderOpts};
 pub use spec::Spec;
 
 /// Output canvas size (px).

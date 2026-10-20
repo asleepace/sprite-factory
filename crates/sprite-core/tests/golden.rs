@@ -94,3 +94,23 @@ fn rendering_is_deterministic() {
     assert!(a == b);
     assert_eq!(a.len(), 8);
 }
+
+#[test]
+fn hd_renders_the_same_spec_at_higher_resolution() {
+    let pal = Palette::new();
+    let v = serde_json::json!({"name": "b", "anim": "bob", "prims": [
+        {"t": "ellipse", "c": [16, 16], "r": 10, "m": "red", "edge": true},
+        {"t": "px", "pts": [[14, 14]], "m": "black", "shade": 0}
+    ]});
+    let s = Spec::from_json(&v, &pal).unwrap();
+    assert!(!sprite_core::hd_size_ok(100) && !sprite_core::hd_size_ok(32) && sprite_core::hd_size_ok(256));
+    let frames = sprite_core::render_anim_hd(&s, &pal, &RenderOpts::default(), 128);
+    assert_eq!(frames.len(), 8);
+    let f = &frames[0];
+    assert_eq!(f.px.len(), 128 * 128 * 4);
+    // the ball covers roughly the same fraction of the canvas as at 32px (~31%, plus outline)
+    let opaque = f.px.chunks(4).filter(|p| p[3] > 0).count() as f64 / (128.0 * 128.0);
+    assert!((0.28..0.40).contains(&opaque), "coverage {opaque}");
+    // edges stay hard: every pixel is fully opaque or fully transparent
+    assert!(f.px.chunks(4).all(|p| p[3] == 0 || p[3] == 255));
+}

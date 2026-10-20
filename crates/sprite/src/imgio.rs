@@ -160,6 +160,23 @@ pub fn gif(frames: &[Frame], scale: usize, ms: u32) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Looping animated GIF from square RGBA buffers of any size (HD frames), transparent background.
+pub fn gif_raw(frames: &[&[u8]], side: usize, ms: u32) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    {
+        let mut enc = gif::Encoder::new(&mut out, side as u16, side as u16, &[])?;
+        enc.set_repeat(gif::Repeat::Infinite)?;
+        for f in frames {
+            let mut px = f.to_vec();
+            let mut fr = gif::Frame::from_rgba_speed(side as u16, side as u16, &mut px, 10);
+            fr.delay = (ms / 10) as u16;
+            fr.dispose = gif::DisposalMethod::Background;
+            enc.write_frame(&fr)?;
+        }
+    }
+    Ok(out)
+}
+
 /// Grid of first frames with a label under each — the image a model critiques.
 pub fn contact_sheet(items: &[(String, Frame)], scale: usize, cols: usize) -> Rgb {
     let cols = cols.max(1).min(items.len().max(1));

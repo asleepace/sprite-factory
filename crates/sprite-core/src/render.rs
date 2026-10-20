@@ -52,7 +52,42 @@ fn shade_from_normal(nx: f64, ny: f64, nz: f64, l: &[f64; 3], gloss: bool) -> i3
 }
 
 pub fn render_frame(spec: &Spec, t: f64, pal: &Palette, opts: &RenderOpts) -> Frame {
-    let n = SIZE * SS;
+    Frame(render_sized(spec, t, pal, opts, SIZE, SS))
+}
+
+/// A high-definition frame: the same spec drawn on a `size`×`size` canvas instead of 32×32.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HdFrame {
+    pub size: usize,
+    pub px: Vec<u8>,
+}
+
+/// Supported HD sizes: multiples of 32 from 64 to 1024.
+pub fn hd_size_ok(size: usize) -> bool {
+    (64..=1024).contains(&size) && size % 32 == 0
+}
+
+/// Draw the spec at `size`×`size` (a multiple of 32). Curves come from the vector shapes, so the
+/// result is genuinely higher resolution, not an upscale. Shading bands, palette and outline style
+/// match the 32px sprite; outlines and edge lines get thinner relative to the body.
+pub fn render_frame_hd(spec: &Spec, t: f64, pal: &Palette, opts: &RenderOpts, size: usize) -> HdFrame {
+    assert!(hd_size_ok(size), "HD size must be a multiple of 32 between 64 and 1024");
+    HdFrame { size, px: render_sized(spec, t, pal, opts, size, 2) }
+}
+
+pub fn render_anim_hd(spec: &Spec, pal: &Palette, opts: &RenderOpts, size: usize) -> Vec<HdFrame> {
+    if !spec.is_animated() {
+        return vec![render_frame_hd(spec, 0.0, pal, opts, size)];
+    }
+    let f = spec.frames.max(1);
+    (0..f).map(|i| render_frame_hd(spec, i as f64 / f as f64, pal, opts, size)).collect()
+}
+
+/// Core renderer: output `size`×`size` RGBA, supersampled `ss`×. Spec coordinates are always in
+/// 32px sprite units; `k` = output px per sprite px, `cs` = supersampled px per sprite px.
+fn render_sized(spec: &Spec, t: f64, pal: &Palette, opts: &RenderOpts, size: usize, ss: usize) -> Vec<u8> {
+    let k = size / 32;
+    let n = size * ss;
     let prims = &spec.prims;
     let pm = frame_transforms(spec, t);
     let lightv = light();
@@ -71,7 +106,7 @@ pub fn render_frame(spec: &Spec, t: f64, pal: &Palette, opts: &RenderOpts) -> Fr
         if p.flipx {
             m = mul(&m, &affine(0.0, -1.0, 1.0, 0.0, 0.0, [16.0, 16.0]));
         }
-        let ssf = SS as f64;
+        let ssf = (k * ss) as f64; // coordinate scale: sprite px → supersampled px
         let mut mask = Mask::new(n);
         match &outline {
             Outline::Poly(pts) => {
@@ -132,7 +167,8 @@ pub fn render_frame(spec: &Spec, t: f64, pal: &Palette, opts: &RenderOpts) -> Fr
         let Some([bx0, by0, bx1, by1]) = mask.bbox() else { continue };
         let bw = (bx1 - bx0 + 1) as f64 / ssf;
         let bh = (by1 - by0 + 1) as f64 / ssf;
-        let margin = 8usize;
+        let sigma = 1.2 * ssf / 8.0;
+        let margin = 8usize.max((4.0 * sigma) as usize + 4);
         let cx0 = bx0.saturating_sub(margin);
         let cy0 = by0.saturating_sub(margin);
         let cx1 = (bx1 + margin + 1).min(n);
@@ -154,7 +190,7 @@ pub fn render_frame(spec: &Spec, t: f64, pal: &Palette, opts: &RenderOpts) -> Fr
                 r * (1.0 - (1.0 - x).powi(2)).clamp(0.0, 1.0).sqrt() * p.height
             })
             .collect();
-        let hs = gaussian(&hf, cw, ch, 1.2);
+        let hs = gaussian(&hf, cw, ch, sigma);
         let (gy, gx) = gradient(&hs, cw, ch);
         for y in 0..ch {
             for x in 0..cw {
@@ -177,19 +213,19 @@ pub fn render_frame(spec: &Spec, t: f64, pal: &Palette, opts: &RenderOpts) -> Fr
     for (i, p) in prims.iter().enumerate() {
         wvec[i + 1] = p.weight;
     }
-    let ss2 = (SS * SS) as f64;
+    let ss2 = (ss * ss) as f64;
     let cov_need = ss2 * 0.42;
-    let mut lab = vec![0i32; SIZE * SIZE];
-    let mut sh = vec![0i32; SIZE * SIZE];
-    let mut vals: Vec<i32> = Vec::with_capacity(SS * SS);
-    for by in 0..SIZE {
-        for bx in 0..SIZE {
+    let mut lab = vec![0i32; size * size];
+    let mut sh = vec![0i32; size * size];
+    let mut vals: Vec<i32> = Vec::with_capacity(ss * ss);
+    for by in 0..size {
+        for bx in 0..size {
             vals.clear();
-            for yy in 0..SS {
-                for xx in 0..SS {
-                    let k = (by * SS + yy) * n + bx * SS + xx;
-                    if label[k] > 0 {
-                        vals.push(label[k] * 8 + shade[k] as i32);
+            for yy in 0..ss {
+                for xx in 0..ss {
+                    let q = (by * ss + yy) * n + bx * ss + xx;
+                    if label[q] > 0 {
+                        vals.push(label[q] * 8 + shade[q] as i32);
                     }
                 }
             }
@@ -217,16 +253,16 @@ pub fn render_frame(spec: &Spec, t: f64, pal: &Palette, opts: &RenderOpts) -> Fr
                 }
                 i = j;
             }
-            lab[by * SIZE + bx] = best / 8;
-            sh[by * SIZE + bx] = best % 8;
+            lab[by * size + bx] = best / 8;
+            sh[by * size + bx] = best % 8;
         }
     }
-    let at = |x: usize, y: usize| y * SIZE + x;
+    let at = |x: usize, y: usize| y * size + x;
 
     // ── cleanup: lone shade pixels inside one prim take the majority neighbour shade
     let mut new = sh.clone();
-    for y in 1..SIZE - 1 {
-        for x in 1..SIZE - 1 {
+    for y in 1..size - 1 {
+        for x in 1..size - 1 {
             let l = lab[at(x, y)];
             if l == 0 {
                 continue;
@@ -249,17 +285,19 @@ pub fn render_frame(spec: &Spec, t: f64, pal: &Palette, opts: &RenderOpts) -> Fr
     }
     let mut sh = new;
 
-    // ── internal edge lines
+    // ── internal edge lines: lower-prim pixels within `e` px of an `edge` prim go dark
+    let e = (k as f64 * 0.5).round().max(1.0) as i32;
+    let nbhd = neighbourhood(e);
     let mut edge_px = Vec::new();
-    for y in 0..SIZE {
-        for x in 0..SIZE {
+    for y in 0..size {
+        for x in 0..size {
             let li = lab[at(x, y)];
             if li == 0 {
                 continue;
             }
-            for (dy, dx) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
+            for &(dy, dx) in &nbhd {
                 let (yy, xx) = (y as i32 + dy, x as i32 + dx);
-                if (0..SIZE as i32).contains(&yy) && (0..SIZE as i32).contains(&xx) {
+                if (0..size as i32).contains(&yy) && (0..size as i32).contains(&xx) {
                     let lj = lab[at(xx as usize, yy as usize)];
                     if lj > li && prims[(lj - 1) as usize].edge {
                         edge_px.push(at(x, y));
@@ -269,54 +307,72 @@ pub fn render_frame(spec: &Spec, t: f64, pal: &Palette, opts: &RenderOpts) -> Fr
             }
         }
     }
-    for k in edge_px {
-        sh[k] = 0;
+    for q in edge_px {
+        sh[q] = 0;
     }
 
     // ── colourize
-    let mut rgba = vec![0u8; SIZE * SIZE * 4];
-    for k in 0..SIZE * SIZE {
-        let li = lab[k];
+    let mut rgba = vec![0u8; size * size * 4];
+    for q in 0..size * size {
+        let li = lab[q];
         if li == 0 {
             continue;
         }
-        let c = pal.ramp(prims[(li - 1) as usize].m)[sh[k] as usize];
-        rgba[k * 4..k * 4 + 3].copy_from_slice(&c);
-        rgba[k * 4 + 3] = 255;
+        let c = pal.ramp(prims[(li - 1) as usize].m)[sh[q] as usize];
+        rgba[q * 4..q * 4 + 3].copy_from_slice(&c);
+        rgba[q * 4 + 3] = 255;
     }
 
-    // ── pixel overrides
+    // ── pixel overrides (eyes, glints): one pixel at 32px; a round dot of the same footprint in HD
     let px_label = prims.len() as i32 + 1;
     for (i, p) in prims.iter().enumerate() {
         if p.kind != Kind::Px {
             continue;
         }
         let col = pal.ramp(p.m)[p.shade as usize];
-        for q in &p.pts {
-            let a = apply(&pm[i], *q);
+        for qp in &p.pts {
+            let a = apply(&pm[i], *qp);
             let (xi, yi) = (a[0].floor(), a[1].floor());
-            if xi >= 0.0 && yi >= 0.0 && (xi as usize) < SIZE && (yi as usize) < SIZE {
-                let k = at(xi as usize, yi as usize);
-                rgba[k * 4..k * 4 + 3].copy_from_slice(&col);
-                rgba[k * 4 + 3] = 255;
-                if lab[k] == 0 {
-                    lab[k] = px_label;
+            if !(xi >= 0.0 && yi >= 0.0 && xi < 32.0 && yi < 32.0) {
+                continue;
+            }
+            let (cx, cy) = ((xi + 0.5) * k as f64, (yi + 0.5) * k as f64);
+            let rad = k as f64 * 0.62;
+            let (x0, x1) = ((xi as usize) * k, (xi as usize + 1) * k);
+            let (y0, y1) = ((yi as usize) * k, (yi as usize + 1) * k);
+            let pad = if k > 1 { 1 } else { 0 };
+            for y in y0.saturating_sub(pad)..(y1 + pad).min(size) {
+                for x in x0.saturating_sub(pad)..(x1 + pad).min(size) {
+                    if k > 1 {
+                        let (dx, dy) = (x as f64 + 0.5 - cx, y as f64 + 0.5 - cy);
+                        if dx * dx + dy * dy > rad * rad {
+                            continue;
+                        }
+                    }
+                    let q = at(x, y);
+                    rgba[q * 4..q * 4 + 3].copy_from_slice(&col);
+                    rgba[q * 4 + 3] = 255;
+                    if lab[q] == 0 {
+                        lab[q] = px_label;
+                    }
                 }
             }
         }
     }
 
-    // ── selective outer outline
-    let opaque: Vec<bool> = (0..SIZE * SIZE).map(|k| rgba[k * 4 + 3] > 0).collect();
+    // ── selective outer outline, `o` px thick (1 at 32px), coloured from the nearest shape
+    let o = (k as f64 * 0.6).round().max(1.0) as i32;
+    let ring = neighbourhood(o);
+    let opaque: Vec<bool> = (0..size * size).map(|q| rgba[q * 4 + 3] > 0).collect();
     let black = pal.index_of("black").unwrap();
-    for y in 0..SIZE {
-        for x in 0..SIZE {
+    for y in 0..size {
+        for x in 0..size {
             if opaque[at(x, y)] {
                 continue;
             }
-            for (dy, dx) in [(1i32, 0i32), (0, 1), (-1, 0), (0, -1)] {
+            for &(dy, dx) in &ring {
                 let (yy, xx) = (y as i32 + dy, x as i32 + dx);
-                if !((0..SIZE as i32).contains(&yy) && (0..SIZE as i32).contains(&xx)) {
+                if !((0..size as i32).contains(&yy) && (0..size as i32).contains(&xx)) {
                     continue;
                 }
                 let q = at(xx as usize, yy as usize);
@@ -326,16 +382,34 @@ pub fn render_frame(spec: &Spec, t: f64, pal: &Palette, opts: &RenderOpts) -> Fr
                 let li = lab[q];
                 let m = if li > 0 && (li as usize) <= prims.len() { prims[(li - 1) as usize].m } else { black };
                 let c = pal.ramp(m)[0];
-                let k = at(x, y);
+                let d = at(x, y);
                 for ch in 0..3 {
-                    rgba[k * 4 + ch] = (0.55 * c[ch] as f64 + 0.45 * INK[ch]) as u8;
+                    rgba[d * 4 + ch] = (0.55 * c[ch] as f64 + 0.45 * INK[ch]) as u8;
                 }
-                rgba[k * 4 + 3] = 255;
+                rgba[d * 4 + 3] = 255;
                 break;
             }
         }
     }
-    Frame(rgba)
+    rgba
+}
+
+/// Offsets within radius `r`, nearest first. r = 1 is the classic 4-neighbourhood (down, right,
+/// up, left), which keeps 32px output identical to the original renderer.
+fn neighbourhood(r: i32) -> Vec<(i32, i32)> {
+    if r <= 1 {
+        return vec![(1, 0), (0, 1), (-1, 0), (0, -1)];
+    }
+    let mut v: Vec<(i32, i32)> = Vec::new();
+    for dy in -r..=r {
+        for dx in -r..=r {
+            if (dx, dy) != (0, 0) && dx * dx + dy * dy <= r * r {
+                v.push((dy, dx));
+            }
+        }
+    }
+    v.sort_by_key(|&(dy, dx)| dy * dy + dx * dx);
+    v
 }
 
 pub fn render_anim(spec: &Spec, pal: &Palette, opts: &RenderOpts) -> Vec<Frame> {

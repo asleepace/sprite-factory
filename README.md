@@ -26,6 +26,7 @@ cargo test --release --workspace
 
 ```bash
 sprite render  testdata/nouns/*.json --out out/          # PNG + strip + GIF per sprite
+sprite hd      testdata/nouns/*.json --size 512 --out hd/ # the same specs redrawn in high definition (64–1024px)
 sprite sheet   testdata/nouns/food.json --out food.png   # labelled contact sheet (--numbered for blind review)
 sprite strips  testdata/nouns/food.json --out anim.png   # every animation frame
 sprite atlas   library/ --out atlas --scale 2            # atlas.png + atlas.json (Phaser/Pixi JSON hash)
@@ -35,6 +36,11 @@ sprite bench   testdata/nouns/*.json
 ```
 
 Inputs can be batch files (JSON arrays), single-spec files, or folders of either.
+
+**High definition.** Specs are vector shapes in 32px units, so `sprite hd` redraws them on a larger
+canvas instead of scaling pixels up: smooth curves, the same palette, light and cel-shading bands,
+proportionally thinner outlines. Shortcuts that only work at 32px (single-pixel teeth, stacked eye
+pixels) show up at HD, so prefer real shapes for features that matter.
 
 ## MCP server
 

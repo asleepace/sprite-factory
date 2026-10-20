@@ -32,6 +32,17 @@ enum Cmd {
         #[arg(long, num_args = 1..)]
         only: Vec<String>,
     },
+    /// High-definition render: the same specs drawn at --size px (smooth curves, not upscaled pixels)
+    Hd {
+        files: Vec<PathBuf>,
+        #[arg(long, default_value = "out")]
+        out: PathBuf,
+        #[arg(long, num_args = 1..)]
+        only: Vec<String>,
+        /// canvas size in px: a multiple of 32 from 64 to 1024
+        #[arg(long, default_value_t = 256)]
+        size: usize,
+    },
     /// Labelled contact sheet of first frames (what a model looks at to critique)
     Sheet {
         files: Vec<PathBuf>,
@@ -149,6 +160,27 @@ fn main() -> Result<()> {
                 library::save_sprite_outputs(&out, library::spec_name(&v), &frames, ms)?;
             }
             println!("rendered {} → {}", specs.len(), out.display());
+        }
+        Cmd::Hd { files, out, only, size } => {
+            if !sprite_core::hd_size_ok(size) {
+                bail!("--size must be a multiple of 32 between 64 and 1024");
+            }
+            let specs = filtered(&files, &only)?;
+            let parsed: Vec<(Value, Spec)> = specs
+                .iter()
+                .map(|v| Spec::from_json(v, &pal).map(|s| (v.clone(), s)).map_err(|e| anyhow::anyhow!("{}: {}", library::spec_name(v), e.join("; "))))
+                .collect::<Result<_>>()?;
+            let rendered = library::par_map(&parsed, |(_, s)| sprite_core::render_anim_hd(s, &pal, &opts, size));
+            for ((v, s), frames) in parsed.iter().zip(rendered) {
+                let name = library::spec_name(v);
+                let first = Rgba { w: size, h: size, px: frames[0].px.clone() };
+                imgio::write(&out.join(format!("{name}_hd{size}.png")), &first.png()?)?;
+                if frames.len() > 1 {
+                    let bufs: Vec<&[u8]> = frames.iter().map(|f| f.px.as_slice()).collect();
+                    imgio::write(&out.join(format!("{name}_hd{size}.gif")), &imgio::gif_raw(&bufs, size, s.ms)?)?;
+                }
+            }
+            println!("rendered {} at {size}px → {}", parsed.len(), out.display());
         }
         Cmd::Sheet { files, out, scale, cols, only, numbered } => {
             let specs = filtered(&files, &only)?;
