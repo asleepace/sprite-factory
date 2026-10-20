@@ -1,0 +1,52 @@
+[Unit]
+Description=Sprite Factory (private MCP + REST)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sprite
+Group=sprite
+EnvironmentFile=/etc/sprite/sprite.env
+ExecStart=/usr/local/bin/sprite serve
+Restart=on-failure
+RestartSec=2
+
+# The library is the only writable path; everything else is read-only or hidden.
+StateDirectory=sprite
+ReadWritePaths=/var/lib/sprite
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+UMask=0027
+
+# Resource ceilings: rendering is CPU-bound; keep it from starving the rest of the box.
+MemoryMax=512M
+CPUQuota=150%
+TasksMax=64
+
+# No outbound network unless you set ANTHROPIC_API_KEY for blind_review.
+# Uncomment to block everything except loopback (nginx talks to us over 127.0.0.1):
+#IPAddressDeny=any
+#IPAddressAllow=localhost
+
+[Install]
+WantedBy=multi-user.target

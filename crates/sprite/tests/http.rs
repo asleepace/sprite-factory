@@ -1,0 +1,176 @@
+//! `sprite serve`: auth, REST endpoints, caching, and MCP over Streamable HTTP sharing the
+//! same library as the REST API.
+
+use rmcp::model::{CallToolRequestParams, ContentBlock};
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+use rmcp::transport::StreamableHttpClientTransport;
+use rmcp::ServiceExt;
+use serde_json::{json, Value};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
+use std::process::{Child, Command, Stdio};
+
+const TOKEN: &str = "test-token-0123456789abcdef0123456789";
+
+struct Server {
+    child: Child,
+    addr: String,
+    lib: std::path::PathBuf,
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+    }
+}
+
+fn start() -> Server {
+    let lib = std::env::temp_dir().join(format!(
+        "sprite-http-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    std::fs::create_dir_all(&lib).unwrap();
+    std::fs::write(
+        lib.join("apple.json"),
+        json!({"name":"apple","cat":"food","anim":"bob","prims":[{"t":"ellipse","c":[16,17],"r":[11,10],"m":"red","gloss":true}]}).to_string(),
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sprite"))
+        .args(["serve", "--bind", "127.0.0.1:0", "--library"])
+        .arg(&lib)
+        .env("SPRITE_TOKENS", format!("tester:{TOKEN}"))
+        .env_remove("ANTHROPIC_API_KEY")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
+    let addr = line.split("http://").nth(1).unwrap().split_whitespace().next().unwrap().to_string();
+    Server { child, addr, lib }
+}
+
+/// Tiny HTTP/1.1 client: (status, headers, body).
+fn req(addr: &str, method: &str, path: &str, headers: &[(&str, &str)], body: &[u8]) -> (u16, String, Vec<u8>) {
+    let mut s = TcpStream::connect(addr).unwrap();
+    let mut h = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\n", body.len());
+    for (k, v) in headers {
+        h.push_str(&format!("{k}: {v}\r\n"));
+    }
+    h.push_str("\r\n");
+    s.write_all(h.as_bytes()).unwrap();
+    s.write_all(body).unwrap();
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).unwrap();
+    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let head = String::from_utf8_lossy(&raw[..split]).to_string();
+    let mut body = raw[split + 4..].to_vec();
+    if head.to_ascii_lowercase().contains("transfer-encoding: chunked") {
+        body = dechunk(&body);
+    }
+    let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+    (status, head, body)
+}
+
+fn dechunk(mut b: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let nl = b.windows(2).position(|w| w == b"\r\n").unwrap();
+        let n = usize::from_str_radix(std::str::from_utf8(&b[..nl]).unwrap().trim(), 16).unwrap();
+        if n == 0 {
+            return out;
+        }
+        out.extend_from_slice(&b[nl + 2..nl + 2 + n]);
+        b = &b[nl + 4 + n..];
+    }
+}
+
+fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().find_map(|l| {
+        let (k, v) = l.split_once(':')?;
+        k.eq_ignore_ascii_case(name).then(|| v.trim())
+    })
+}
+
+const AUTH: (&str, &str) = ("Authorization", "Bearer test-token-0123456789abcdef0123456789");
+
+#[test]
+fn rest_auth_and_assets() {
+    let s = start();
+    assert_eq!(req(&s.addr, "GET", "/healthz", &[], b"").0, 200);
+    assert_eq!(req(&s.addr, "GET", "/v1/sprites", &[], b"").0, 401);
+    assert_eq!(req(&s.addr, "GET", "/v1/sprites", &[("Authorization", "Bearer wrong")], b"").0, 401);
+
+    let (st, _, body) = req(&s.addr, "GET", "/v1/sprites", &[AUTH], b"");
+    assert_eq!(st, 200);
+    let list: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(list["count"], 1);
+    assert_eq!(list["sprites"][0]["frames"], 8);
+
+    // ?key= works where headers can't be set
+    let (st, head, png) = req(&s.addr, "GET", &format!("/v1/sprites/apple.png?scale=4&key={TOKEN}"), &[], b"");
+    assert_eq!(st, 200);
+    assert_eq!(header(&head, "content-type"), Some("image/png"));
+    assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+    assert_eq!(u32::from_be_bytes(png[16..20].try_into().unwrap()), 128, "scale 4 → 128px wide");
+
+    // ETag revalidation
+    let tag = header(&head, "etag").unwrap().to_string();
+    let (st, _, _) = req(&s.addr, "GET", "/v1/sprites/apple.png?scale=4", &[AUTH, ("If-None-Match", &tag)], b"");
+    assert_eq!(st, 304);
+
+    let (st, head, gif) = req(&s.addr, "GET", "/v1/sprites/apple.gif", &[AUTH], b"");
+    assert_eq!((st, header(&head, "content-type")), (200, Some("image/gif")));
+    assert_eq!(&gif[..6], b"GIF89a");
+
+    let (st, _, sheet) = req(&s.addr, "GET", "/v1/sprites/apple.sheet.png", &[AUTH], b"");
+    assert_eq!(st, 200);
+    assert_eq!(u32::from_be_bytes(sheet[16..20].try_into().unwrap()), 8 * 32, "8 frames side by side");
+
+    let (st, _, body) = req(&s.addr, "GET", "/v1/atlas.json?scale=2", &[AUTH], b"");
+    assert_eq!(st, 200);
+    let atlas: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(atlas["meta"]["image"], "atlas.png?scale=2");
+    assert_eq!(atlas["frames"]["apple_3"]["frame"]["x"], 3 * 64);
+    assert_eq!(req(&s.addr, "GET", "/v1/atlas.png", &[AUTH], b"").0, 200);
+
+    // ad-hoc render: errors are specific, success returns an image, nothing is saved
+    let (st, _, body) = req(&s.addr, "POST", "/v1/render?format=json", &[AUTH], br#"{"prims":[{"t":"blob"}]}"#);
+    assert_eq!(st, 422);
+    assert!(String::from_utf8_lossy(&body).contains("unknown type"));
+    let (st, head, _) = req(&s.addr, "POST", "/v1/render?format=gif", &[AUTH], br#"{"name":"tmp","anim":"spin","prims":[{"t":"star","c":[16,16],"r":12,"m":"gold"}]}"#);
+    assert_eq!((st, header(&head, "content-type")), (200, Some("image/gif")));
+    assert!(!s.lib.join("tmp.json").exists());
+
+    assert_eq!(req(&s.addr, "GET", "/v1/sprites/nope.png", &[AUTH], b"").0, 404);
+    assert_eq!(req(&s.addr, "GET", "/v1/sprites/..%2Fetc%2Fpasswd.json", &[AUTH], b"").0, 400);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_over_http_shares_the_library() {
+    let s = start();
+    let url = format!("http://{}/mcp", s.addr);
+
+    // no token → the transport can't even initialise
+    let anon = ().serve(StreamableHttpClientTransport::from_config(StreamableHttpClientTransportConfig::with_uri(url.clone()))).await;
+    assert!(anon.is_err(), "unauthenticated MCP must be refused");
+
+    let cfg = StreamableHttpClientTransportConfig::with_uri(url).auth_header(TOKEN);
+    let client = ().serve(StreamableHttpClientTransport::from_config(cfg)).await.expect("connect with token");
+    let tools = client.list_all_tools().await.unwrap();
+    assert_eq!(tools.len(), 9);
+
+    let mut p = CallToolRequestParams::new("create_sprite");
+    p.arguments = json!({"name": "moon", "category": "nature", "prims": [{"t":"arc","c":[16,16],"r":12,"a0":-90,"a1":90,"m":"yellow"}]})
+        .as_object()
+        .cloned();
+    let r = client.call_tool(p).await.unwrap();
+    assert_ne!(r.is_error, Some(true));
+    assert!(r.content.iter().any(|c| matches!(c, ContentBlock::Image(_))));
+    client.cancel().await.unwrap();
+
+    // what the model just made is immediately available to prototypes over REST
+    let (st, _, png) = req(&s.addr, "GET", "/v1/sprites/moon.png", &[AUTH], b"");
+    assert_eq!(st, 200);
+    assert_eq!(&png[1..4], b"PNG");
+}

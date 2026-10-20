@@ -1,0 +1,13 @@
+[package]
+name = "sprite-core"
+description = "Sprite Factory renderer: 2.5D shapes → lit, palette-locked, outlined pixel art. No I/O, WASM-safe."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+png = "0.18.1"

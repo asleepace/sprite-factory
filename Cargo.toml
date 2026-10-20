@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = ["crates/sprite-core", "crates/sprite", "crates/sprite-wasm"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# keep dependencies optimised in debug builds so tests that render stay quick
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev]
+opt-level = 1

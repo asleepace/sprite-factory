@@ -1,0 +1,655 @@
+//! `sprite mcp` — the Sprite Factory MCP server over stdio.
+//!
+//! Same tools as the TypeScript server, minus the Python bridge: rendering happens in-process.
+//! blind_review tries, in order: a direct Anthropic API call (ANTHROPIC_API_KEY), MCP sampling
+//! (MRTR input request on protocol ≥ 2026-07-28, server→client request on older protocols),
+//! then a fallback that returns the unlabeled sheet and answer key.
+#![allow(deprecated)] // sampling types are deprecated upstream (SEP-2577) but still how clients review
+
+use anyhow::Result;
+use base64::Engine;
+use rmcp::model::{
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, CreateMessageRequest, CreateMessageRequestParams,
+    CreateMessageResult, Implementation, InputRequest, InputRequiredResult, ListToolsResult, PaginatedRequestParams,
+    ProtocolVersion, Role, SamplingContent, SamplingMessage, SamplingMessageContentBlock, ServerCapabilities, ServerConfig,
+    Tool,
+};
+use rmcp::model::{ContextInclusion, ImageContent};
+use rmcp::service::RequestContext;
+use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, ServiceExt};
+use serde_json::{json, Map, Value};
+use sprite_core::lint::lint;
+use sprite_core::{render_anim, Frame, Palette, RenderOpts, Spec};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use crate::imgio::{self, Rgba, BACKDROP};
+use crate::library;
+
+const CATEGORIES: [&str; 8] = ["animals", "food", "home", "nature", "vehicles", "places", "people", "misc"];
+const MATERIALS: [&str; 24] = [
+    "red", "orange", "yellow", "gold", "lime", "green", "forest", "teal", "sky", "blue", "navy", "purple", "pink",
+    "brown", "wood", "tan", "skin", "cream", "white", "gray", "steel", "charcoal", "black", "glass",
+];
+const GUIDE: &str = include_str!("../../../AUTHORING.md");
+
+pub fn serve(library: PathBuf) -> Result<()> {
+    std::fs::create_dir_all(&library)?;
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    rt.block_on(async move {
+        let server = SpriteServer::new(library, Reviews::default());
+        let running = server.serve(rmcp::transport::stdio()).await?;
+        running.waiting().await?;
+        Ok(())
+    })
+}
+
+/// review token → sprite names in sheet order. Kept server-side (requestState is untrusted) and
+/// shared across server instances, because over HTTP each MRTR leg can land on a fresh instance.
+pub(crate) type Reviews = Arc<Mutex<HashMap<String, (std::time::Instant, Vec<String>)>>>;
+
+#[derive(Clone)]
+pub(crate) struct SpriteServer {
+    lib: Arc<PathBuf>,
+    reviews: Reviews,
+}
+
+impl SpriteServer {
+    pub(crate) fn new(library: PathBuf, reviews: Reviews) -> Self {
+        SpriteServer { lib: Arc::new(library), reviews }
+    }
+}
+
+// ───────────────────────── tool schemas ─────────────────────────
+
+fn prim_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "One shape. Coordinates on a 32×32 canvas, y down. See style_guide for every field.",
+        "properties": {
+            "t": {"type": "string", "enum": ["ellipse", "rect", "poly", "arc", "star", "ngon", "line", "px"]},
+            "m": {"type": "string", "enum": MATERIALS, "description": "material (colour ramp); never raw colours"},
+            "c": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2, "description": "centre [x,y]"},
+            "r": {"description": "radius or [rx,ry]", "anyOf": [{"type": "number"}, {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2}]},
+            "p": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4, "description": "rect [x0,y0,x1,y1]"},
+            "pts": {"type": "array", "items": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2}},
+            "w": {"type": "number", "description": "line width"},
+            "puff": {"type": "number"}, "height": {"type": "number"}, "round": {"type": "number"},
+            "smooth": {"type": "integer", "minimum": 0, "maximum": 4},
+            "flat": {"type": "boolean"}, "shade": {"type": "integer", "minimum": 0, "maximum": 4},
+            "tone": {"type": "integer", "minimum": -2, "maximum": 2},
+            "gloss": {"type": "boolean"}, "edge": {"type": "boolean"}, "weight": {"type": "number"},
+            "rot": {"type": "number"}, "cut": {"type": "boolean"}, "clip": {"type": "integer"},
+            "lit": {"type": "boolean"}, "cap": {"type": "boolean"},
+            "g": {"type": "string", "description": "animation group"},
+            "r2": {"type": "number"}, "n": {"type": "integer"}, "a": {"type": "number"},
+            "a0": {"type": "number"}, "a1": {"type": "number"}, "pie": {"type": "boolean"}
+        },
+        "required": ["t"],
+        "additionalProperties": true
+    })
+}
+
+fn track_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "g": {"type": "string", "description": "group name, or * for the whole sprite"},
+            "prop": {"type": "string", "enum": ["dx", "dy", "rot", "sx", "sy"]},
+            "amp": {"type": "number"},
+            "wave": {"type": "string", "enum": ["sin", "abs", "abs2", "saw", "square"]},
+            "phase": {"type": "number"},
+            "pivot": {"anyOf": [{"type": "string", "enum": ["center", "bottom", "top", "each"]}, {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2}]}
+        },
+        "required": ["prop", "amp"]
+    })
+}
+
+fn name_schema() -> Value {
+    json!({"type": "string", "pattern": "^[a-z][a-z0-9_]{0,40}$", "description": "lowercase snake_case noun, e.g. teddy_bear"})
+}
+
+fn anim_schema() -> Value {
+    json!({"type": "string", "enum": sprite_core::anim::PRESET_NAMES})
+}
+
+fn obj(props: Value, required: &[&str]) -> Arc<Map<String, Value>> {
+    let v = json!({"type": "object", "properties": props, "required": required});
+    Arc::new(v.as_object().unwrap().clone())
+}
+
+fn tools() -> Vec<Tool> {
+    let t = |name: &'static str, title: &str, desc: &'static str, schema: Arc<Map<String, Value>>| {
+        Tool::new(name, desc, schema).with_title(title)
+    };
+    vec![
+        t("style_guide", "Style guide", "Returns the authoring guide (shape DSL, materials, animation, review checklist). Read before creating sprites.", obj(json!({}), &[])),
+        t("list_sprites", "List sprites", "Lists sprites in the library, optionally by category. sheet=true adds a labelled contact sheet image.",
+            obj(json!({"category": {"type": "string", "enum": CATEGORIES}, "sheet": {"type": "boolean"}}), &[])),
+        t("get_sprite", "Get sprite spec", "Returns a sprite's JSON spec (useful as a reference for a related sprite).", obj(json!({"name": name_schema()}), &["name"])),
+        t("create_sprite", "Create sprite",
+            "Creates a sprite from shapes, renders it and saves it. Returns the sprite, its animation frames and style warnings. Keep shapes inside 1.5–30.5.",
+            obj(json!({
+                "name": name_schema(),
+                "category": {"type": "string", "enum": CATEGORIES},
+                "aka": {"type": "array", "items": {"type": "string"}, "description": "other words a child might use (bunny for rabbit); used by blind_review"},
+                "anim": anim_schema(),
+                "tracks": {"type": "array", "items": track_schema()},
+                "prims": {"type": "array", "items": prim_schema(), "minItems": 1, "maxItems": 40},
+                "overwrite": {"type": "boolean"}
+            }), &["name", "category", "prims"])),
+        t("edit_sprite", "Edit sprite",
+            "Changes an existing sprite and re-renders it. prim_ops (set/merge/insert/delete by index, applied in order) for surgical edits, or prims to replace all shapes.",
+            obj(json!({
+                "name": name_schema(),
+                "anim": anim_schema(),
+                "tracks": {"type": "array", "items": track_schema()},
+                "aka": {"type": "array", "items": {"type": "string"}},
+                "prims": {"type": "array", "items": prim_schema(), "minItems": 1, "maxItems": 40},
+                "prim_ops": {"type": "array", "items": {"type": "object", "properties": {
+                    "op": {"type": "string", "enum": ["set", "merge", "insert", "delete"]},
+                    "index": {"type": "integer", "minimum": 0},
+                    "prim": {"type": "object", "description": "set/insert: full prim; merge: only the fields to change", "additionalProperties": true}
+                }, "required": ["op", "index"]}}
+            }), &["name"])),
+        t("render_sprite", "Render sprite", "Renders an existing sprite without changing it.",
+            obj(json!({"name": name_schema(), "scale": {"type": "integer", "minimum": 1, "maximum": 16}}), &["name"])),
+        t("delete_sprite", "Delete sprite", "Removes a sprite from the library. Cannot be undone.", obj(json!({"name": name_schema()}), &["name"])),
+        t("blind_review", "Blind review",
+            "Tests whether sprites are recognisable without their names: a fresh model sees an unlabeled, shuffled sheet and its guesses are graded. Uses ANTHROPIC_API_KEY if set, else MCP sampling, else returns the sheet and key for a separate reviewer.",
+            obj(json!({"names": {"type": "array", "items": name_schema(), "minItems": 1, "maxItems": 30}}), &["names"])),
+        t("export_atlas", "Export atlas",
+            "Packs sprites (all, a category, or named ones) into a PNG atlas + JSON frame map with animation timings (Phaser/Pixi JSON-hash style), written to the library's _export folder.",
+            obj(json!({
+                "names": {"type": "array", "items": name_schema()},
+                "category": {"type": "string", "enum": CATEGORIES},
+                "scale": {"type": "integer", "minimum": 1, "maximum": 8},
+                "file": {"type": "string", "pattern": "^[a-z0-9_-]{1,40}$"}
+            }), &[])),
+    ]
+}
+
+// ───────────────────────── helpers ─────────────────────────
+
+type ToolOut = Result<CallToolResult, String>;
+
+fn text(s: impl Into<String>) -> ContentBlock {
+    ContentBlock::text(s)
+}
+
+fn image_b64(png: &[u8]) -> ContentBlock {
+    ContentBlock::image(base64::engine::general_purpose::STANDARD.encode(png), "image/png")
+}
+
+pub(crate) fn valid_name(n: &str) -> bool {
+    let mut c = n.chars();
+    matches!(c.next(), Some('a'..='z')) && n.len() <= 41 && c.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+}
+
+fn arg_str<'a>(a: &'a Map<String, Value>, k: &str) -> Option<&'a str> {
+    a.get(k).and_then(Value::as_str)
+}
+
+fn norm(s: &str) -> String {
+    let t: String = s.to_lowercase().chars().map(|c| if c == '_' || c == '-' { ' ' } else { c }).filter(|c| c.is_ascii_lowercase() || *c == ' ').collect();
+    let t = t.trim().to_string();
+    if let Some(stem) = t.strip_suffix("ies") {
+        format!("{stem}y")
+    } else if let Some(stem) = t.strip_suffix('s') {
+        stem.to_string()
+    } else {
+        t
+    }
+}
+
+fn render_spec(v: &Value) -> Result<(Spec, Vec<Frame>), Vec<String>> {
+    let pal = Palette::new();
+    let s = Spec::from_json(v, &pal)?;
+    let f = render_anim(&s, &pal, &RenderOpts::default());
+    Ok((s, f))
+}
+
+fn render_result(v: &Value, headline: &str, scale: usize) -> ToolOut {
+    let (s, frames) = render_spec(v).map_err(|e| format!("Not saved — the spec is invalid:\n- {}", e.join("\n- ")))?;
+    let l = lint(&s, &frames);
+    let mut lines = vec![
+        headline.to_string(),
+        format!("stats: {}", json!({"bbox": l.bbox, "span_px": l.span_px, "colors": l.colors, "frames": l.frames, "prims": l.prims})),
+    ];
+    lines.push(if l.warnings.is_empty() { "style warnings: none".into() } else { format!("style warnings:\n- {}", l.warnings.join("\n- ")) });
+    lines.push("Look at the image: would a 5-year-old name it instantly? Revise with edit_sprite if not.".into());
+    let mut big = Rgba::new(sprite_core::SIZE * scale, sprite_core::SIZE * scale);
+    big.blit_frame(&frames[0], 0, 0, scale);
+    let still = big.on_backdrop(BACKDROP).png().map_err(|e| e.to_string())?;
+    let mut content = vec![text(lines.join("\n")), image_b64(&still)];
+    if frames.len() > 1 {
+        let strip = Rgba::strip(&frames).scaled((scale / 2).max(2)).on_backdrop(BACKDROP).png().map_err(|e| e.to_string())?;
+        content.push(text(format!("animation frames ({}):", s.anim)));
+        content.push(image_b64(&strip));
+    }
+    Ok(CallToolResult::success(content))
+}
+
+impl SpriteServer {
+    fn path(&self, name: &str) -> PathBuf {
+        self.lib.join(format!("{name}.json"))
+    }
+
+    fn load(&self, name: &str) -> Result<Value, String> {
+        if !valid_name(name) {
+            return Err(format!("\"{name}\" is not a valid sprite name (lowercase snake_case)"));
+        }
+        let p = self.path(name);
+        let s = std::fs::read_to_string(&p).map_err(|_| format!("No sprite named \"{name}\". Use list_sprites to see what exists."))?;
+        serde_json::from_str(&s).map_err(|e| format!("{name}.json is not valid JSON: {e}"))
+    }
+
+    fn save(&self, v: &Value) -> Result<(), String> {
+        let name = library::spec_name(v);
+        std::fs::write(self.path(name), serde_json::to_string_pretty(v).unwrap() + "\n").map_err(|e| e.to_string())
+    }
+
+    fn all(&self) -> Vec<Value> {
+        library::load_specs(&[self.lib.as_ref().clone()]).unwrap_or_default()
+    }
+
+    // ── tools ──
+
+    fn list_sprites(&self, a: &Map<String, Value>) -> ToolOut {
+        let mut specs = self.all();
+        if let Some(c) = arg_str(a, "category") {
+            specs.retain(|s| s.get("cat").and_then(Value::as_str) == Some(c));
+        }
+        let mut by_cat: Vec<(String, Vec<String>)> = Vec::new();
+        for s in &specs {
+            let c = s.get("cat").and_then(Value::as_str).unwrap_or("misc").to_string();
+            match by_cat.iter_mut().find(|(k, _)| *k == c) {
+                Some((_, v)) => v.push(library::spec_name(s).into()),
+                None => by_cat.push((c, vec![library::spec_name(s).into()])),
+            }
+        }
+        let summary = if by_cat.is_empty() {
+            "library is empty".to_string()
+        } else {
+            by_cat.iter().map(|(c, ns)| format!("{c} ({}): {}", ns.len(), ns.join(", "))).collect::<Vec<_>>().join("\n")
+        };
+        let mut content = vec![text(format!("{} sprites\n{summary}", specs.len()))];
+        if a.get("sheet").and_then(Value::as_bool).unwrap_or(false) && !specs.is_empty() {
+            let items: Vec<(String, Frame)> = specs
+                .iter()
+                .filter_map(|v| render_spec(v).ok().map(|(_, f)| (library::spec_name(v).to_string(), f[0].clone())))
+                .collect();
+            content.push(image_b64(&imgio::contact_sheet(&items, 2, 12).png().map_err(|e| e.to_string())?));
+        }
+        Ok(CallToolResult::success(content))
+    }
+
+    fn create_sprite(&self, a: &Map<String, Value>) -> ToolOut {
+        let name = arg_str(a, "name").unwrap_or_default();
+        if !valid_name(name) {
+            return Err("name must be lowercase snake_case, e.g. teddy_bear".into());
+        }
+        let cat = arg_str(a, "category").unwrap_or("misc");
+        if !CATEGORIES.contains(&cat) {
+            return Err(format!("category must be one of {CATEGORIES:?}"));
+        }
+        if self.path(name).exists() && !a.get("overwrite").and_then(Value::as_bool).unwrap_or(false) {
+            return Err(format!("\"{name}\" already exists. Use edit_sprite, or pass overwrite: true to replace it."));
+        }
+        let mut spec = Map::new();
+        spec.insert("name".into(), json!(name));
+        spec.insert("cat".into(), json!(cat));
+        if let Some(aka) = a.get("aka") {
+            spec.insert("aka".into(), aka.clone());
+        }
+        spec.insert("anim".into(), a.get("anim").cloned().unwrap_or(json!("none")));
+        spec.insert("tracks".into(), a.get("tracks").cloned().unwrap_or(json!([])));
+        spec.insert("prims".into(), a.get("prims").cloned().unwrap_or(json!([])));
+        let v = Value::Object(spec);
+        let res = render_result(&v, &format!("Created \"{name}\"."), 8)?;
+        self.save(&v)?;
+        Ok(res)
+    }
+
+    fn edit_sprite(&self, a: &Map<String, Value>) -> ToolOut {
+        let name = arg_str(a, "name").unwrap_or_default();
+        let mut v = self.load(name)?;
+        let o = v.as_object_mut().ok_or("stored spec is not an object")?;
+        for k in ["anim", "tracks", "aka", "prims"] {
+            if let Some(x) = a.get(k) {
+                o.insert(k.into(), x.clone());
+            }
+        }
+        if let Some(ops) = a.get("prim_ops").and_then(Value::as_array) {
+            let prims = o.get_mut("prims").and_then(Value::as_array_mut).ok_or("spec has no prims")?;
+            for op in ops {
+                let kind = op.get("op").and_then(Value::as_str).unwrap_or("");
+                let idx = op.get("index").and_then(Value::as_u64).ok_or("each prim_op needs an index")? as usize;
+                let prim = op.get("prim").cloned();
+                let n = prims.len();
+                match kind {
+                    "insert" => {
+                        let p = prim.filter(|p| p.get("t").is_some()).ok_or("insert needs a prim with a type (t)")?;
+                        if idx > n {
+                            return Err(format!("insert at {idx} needs index ≤ {n}"));
+                        }
+                        prims.insert(idx, p);
+                    }
+                    _ if idx >= n => return Err(format!("prim index {idx} out of range (sprite has {n} prims)")),
+                    "delete" => {
+                        prims.remove(idx);
+                    }
+                    "set" => prims[idx] = prim.filter(|p| p.get("t").is_some()).ok_or("set needs a full prim with a type (t)")?,
+                    "merge" => {
+                        let patch = prim.and_then(|p| p.as_object().cloned()).ok_or("merge needs a prim object")?;
+                        let tgt = prims[idx].as_object_mut().ok_or("prim is not an object")?;
+                        for (k, val) in patch {
+                            tgt.insert(k, val);
+                        }
+                    }
+                    other => return Err(format!("unknown op {other:?}")),
+                }
+            }
+        }
+        let res = render_result(&v, &format!("Updated \"{name}\"."), 8)?;
+        self.save(&v)?;
+        Ok(res)
+    }
+
+    fn export_atlas(&self, a: &Map<String, Value>) -> ToolOut {
+        let mut specs = self.all();
+        if let Some(names) = a.get("names").and_then(Value::as_array) {
+            let want: Vec<&str> = names.iter().filter_map(Value::as_str).collect();
+            specs.retain(|s| want.contains(&library::spec_name(s)));
+        }
+        if let Some(c) = arg_str(a, "category") {
+            specs.retain(|s| s.get("cat").and_then(Value::as_str) == Some(c));
+        }
+        if specs.is_empty() {
+            return Err("No sprites matched.".into());
+        }
+        let base = arg_str(a, "file").unwrap_or("atlas");
+        if !base.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') || base.is_empty() {
+            return Err("file must match ^[a-z0-9_-]{1,40}$".into());
+        }
+        let scale = a.get("scale").and_then(Value::as_u64).unwrap_or(1).clamp(1, 8) as usize;
+        let rendered: Vec<(Value, Vec<Frame>)> =
+            specs.into_iter().filter_map(|v| render_spec(&v).ok().map(|(_, f)| (v, f))).collect();
+        let dir = self.lib.join("_export");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let png_name = format!("{base}.png");
+        let (img, meta) = library::atlas(&rendered, scale, &png_name).map_err(|e| e.to_string())?;
+        let png_path = dir.join(&png_name);
+        let json_path = dir.join(format!("{base}.json"));
+        std::fs::write(&png_path, img.png().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        std::fs::write(&json_path, serde_json::to_string_pretty(&meta).unwrap()).map_err(|e| e.to_string())?;
+        let frames: usize = rendered.iter().map(|r| r.1.len()).sum();
+        let preview = {
+            let mut small = Rgba::new(img.w / scale, img.h / scale);
+            for (r, (_, fr)) in rendered.iter().enumerate() {
+                for (k, f) in fr.iter().enumerate() {
+                    small.blit_frame(f, k * sprite_core::SIZE, r * sprite_core::SIZE, 1);
+                }
+            }
+            small.scaled(2).on_backdrop(BACKDROP).png().map_err(|e| e.to_string())?
+        };
+        Ok(CallToolResult::success(vec![
+            text(format!(
+                "Exported {} sprites, {frames} frames, {}×{}px.\n{}\n{}",
+                rendered.len(),
+                img.w,
+                img.h,
+                png_path.display(),
+                json_path.display()
+            )),
+            image_b64(&preview),
+        ]))
+    }
+
+    // ── blind review ──
+
+    fn review_sheet(&self, names: &[String]) -> Result<(Vec<Value>, Vec<u8>), String> {
+        let mut specs = names.iter().map(|n| self.load(n)).collect::<Result<Vec<_>, _>>()?;
+        // shuffle so the order gives nothing away (xorshift seeded from time; no rand dep)
+        let mut seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(7) | 1;
+        for i in (1..specs.len()).rev() {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            specs.swap(i, (seed % (i as u64 + 1)) as usize);
+        }
+        let items: Vec<(String, Frame)> = specs
+            .iter()
+            .enumerate()
+            .map(|(i, v)| render_spec(v).map(|(_, f)| (format!("#{}", i + 1), f[0].clone())).map_err(|e| e.join("; ")))
+            .collect::<Result<_, _>>()?;
+        let png = imgio::contact_sheet(&items, 5, 5).png().map_err(|e| e.to_string())?;
+        Ok((specs, png))
+    }
+
+    fn review_prompt(n: usize) -> String {
+        format!(
+            "This image shows {n} numbered pixel-art sprites from a picture-vocabulary game for 4–6 year olds. \
+             For each, give the word a young child would most likely say (1–2 words), your confidence 0–100, and up to two \
+             things it could be mistaken for. Reply with ONLY a JSON array: [{{\"n\":1,\"guess\":\"...\",\"conf\":90,\"alts\":[\"...\"]}}]"
+        )
+    }
+
+    fn grade(specs: &[Value], reply: &str) -> ToolOut {
+        let (a, b) = (reply.find('['), reply.rfind(']'));
+        let guesses: Vec<Value> = match (a, b) {
+            (Some(a), Some(b)) if b > a => serde_json::from_str(&reply[a..=b]).map_err(|e| format!("Reviewer reply was not valid JSON: {e}"))?,
+            _ => return Err(format!("Reviewer reply had no JSON array: {}", reply.chars().take(200).collect::<String>())),
+        };
+        let mut passed = 0;
+        let mut lines = Vec::new();
+        for (i, s) in specs.iter().enumerate() {
+            let name = library::spec_name(s);
+            let g = guesses.iter().find(|g| g.get("n").and_then(Value::as_u64) == Some(i as u64 + 1));
+            let mut accepted = vec![norm(name)];
+            if let Some(aka) = s.get("aka").and_then(Value::as_array) {
+                accepted.extend(aka.iter().filter_map(Value::as_str).map(norm));
+            }
+            let line = match g {
+                None => format!("NO ANSWER {name}"),
+                Some(g) => {
+                    let guess = g.get("guess").and_then(Value::as_str).unwrap_or("");
+                    let conf = g.get("conf").and_then(Value::as_f64).unwrap_or(0.0);
+                    let alts: Vec<&str> = g.get("alts").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+                    let ok = accepted.contains(&norm(guess));
+                    let verdict = if !ok { "FAIL" } else if conf >= 80.0 { "PASS" } else { "WEAK" };
+                    if verdict == "PASS" {
+                        passed += 1;
+                    }
+                    let alts = if alts.is_empty() { String::new() } else { format!("; could be {}", alts.join(", ")) };
+                    format!("{verdict:<5} {name}: read as \"{guess}\" ({conf}%){alts}")
+                }
+            };
+            lines.push(line);
+        }
+        Ok(CallToolResult::success(vec![text(format!(
+            "{passed}/{} passed.\n{}\n\nFix FAIL and WEAK sprites so they cannot be confused with the alternatives, then run blind_review again.",
+            specs.len(),
+            lines.join("\n")
+        ))]))
+    }
+
+    fn sampling_params(png: &[u8], n: usize) -> CreateMessageRequestParams {
+        let img = SamplingMessageContentBlock::Image(ImageContent::new(base64::engine::general_purpose::STANDARD.encode(png), "image/png"));
+        let mut p = CreateMessageRequestParams::new(
+            vec![SamplingMessage::new_multiple(Role::User, vec![img, SamplingMessageContentBlock::text(Self::review_prompt(n))])],
+            1500,
+        );
+        p.system_prompt = Some("You are a strict blind reviewer. Judge only from the picture.".into());
+        p.include_context = Some(ContextInclusion::None);
+        p
+    }
+
+    fn reply_text(r: &CreateMessageResult) -> String {
+        let blocks: Vec<&SamplingMessageContentBlock> = match &r.message.content {
+            SamplingContent::Single(b) => vec![b],
+            SamplingContent::Multiple(v) => v.iter().collect(),
+        };
+        blocks
+            .into_iter()
+            .filter_map(|b| match b {
+                SamplingMessageContentBlock::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    async fn blind_review(&self, a: &Map<String, Value>, req: &CallToolRequestParams, ctx: &RequestContext<RoleServer>) -> Result<CallToolResponse, String> {
+        // retry leg of an MRTR round trip
+        if let (Some(responses), Some(token)) = (&req.input_responses, &req.request_state) {
+            let names = self.reviews.lock().unwrap().remove(token).map(|(_, n)| n).ok_or("This review expired; run blind_review again.")?;
+            let specs = names.iter().map(|n| self.load(n)).collect::<Result<Vec<_>, _>>()?;
+            let raw = responses.get("review").ok_or("client did not answer the review request")?;
+            let result: CreateMessageResult = serde_json::from_value(raw.clone()).map_err(|e| format!("bad sampling result: {e}"))?;
+            return Self::grade(&specs, &Self::reply_text(&result)).map(Into::into);
+        }
+
+        let names: Vec<String> = a.get("names").and_then(Value::as_array).map(|v| v.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default();
+        if names.is_empty() || names.len() > 30 {
+            return Err("names must list 1–30 sprites".into());
+        }
+        let (specs, png) = self.review_sheet(&names)?;
+        let shuffled: Vec<String> = specs.iter().map(|s| library::spec_name(s).to_string()).collect();
+
+        // 1) direct API call, if configured
+        if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+            let png2 = png.clone();
+            let n = specs.len();
+            let reply = tokio::task::spawn_blocking(move || anthropic_review(&key, &png2, n)).await.map_err(|e| e.to_string())??;
+            return Self::grade(&specs, &reply).map(Into::into);
+        }
+
+        // 2) MCP sampling
+        let caps = ctx.meta.client_capabilities().or_else(|| ctx.peer.peer_info().map(|i| i.capabilities.clone()));
+        let version = ctx.meta.protocol_version().or_else(|| ctx.peer.peer_info().map(|i| i.protocol_version.clone()));
+        if caps.as_ref().is_some_and(|c| c.sampling.is_some()) {
+            let params = Self::sampling_params(&png, specs.len());
+            let modern = version.as_ref().is_some_and(|v| v.as_str() >= ProtocolVersion::V_2026_07_28.as_str());
+            if modern {
+                let token = format!("rv-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+                let mut pending = self.reviews.lock().unwrap();
+                // forget reviews a client started but never answered
+                pending.retain(|_, (t, _)| t.elapsed() < std::time::Duration::from_secs(600));
+                pending.insert(token.clone(), (std::time::Instant::now(), shuffled));
+                drop(pending);
+                let mut reqs = std::collections::BTreeMap::new();
+                reqs.insert("review".to_string(), InputRequest::CreateMessage(CreateMessageRequest::new(params)));
+                return Ok(InputRequiredResult::new(Some(reqs), Some(token)).into());
+            }
+            let out = ctx.peer.create_message(params).await.map_err(|e| format!("Sampling failed: {e}"))?;
+            return Self::grade(&specs, &Self::reply_text(&out)).map(Into::into);
+        }
+
+        // 3) fallback
+        let key: Vec<String> = shuffled.iter().enumerate().map(|(i, n)| format!("#{}={n}", i + 1)).collect();
+        Ok(CallToolResult::success(vec![
+            text(format!(
+                "No reviewer is available here (no ANTHROPIC_API_KEY and the client does not support sampling). Give the image to a \
+                 reviewer that has NOT seen the names and ask what a young child would call each numbered sprite.\nKey: {}",
+                key.join(", ")
+            )),
+            image_b64(&png),
+        ])
+        .into())
+    }
+}
+
+/// Ask Claude directly (Messages API). ANTHROPIC_BASE_URL and SPRITE_REVIEW_MODEL override the defaults.
+fn anthropic_review(key: &str, png: &[u8], n: usize) -> Result<String, String> {
+    let base = std::env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| "https://api.anthropic.com".into());
+    let model = std::env::var("SPRITE_REVIEW_MODEL").unwrap_or_else(|_| "claude-sonnet-5-5".into());
+    let body = json!({
+        "model": model,
+        "max_tokens": 1500,
+        "system": "You are a strict blind reviewer. Judge only from the picture.",
+        "messages": [{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": base64::engine::general_purpose::STANDARD.encode(png)}},
+            {"type": "text", "text": SpriteServer::review_prompt(n)}
+        ]}]
+    });
+    let mut resp = ureq::post(format!("{}/v1/messages", base.trim_end_matches('/')))
+        .header("x-api-key", key)
+        .header("anthropic-version", "2023-06-01")
+        .send_json(&body)
+        .map_err(|e| format!("Review API call failed: {e}"))?;
+    let v: Value = resp.body_mut().read_json().map_err(|e| format!("Review API returned bad JSON: {e}"))?;
+    let reply: Vec<&str> = v
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|b| b.get("text").and_then(Value::as_str)).collect())
+        .unwrap_or_default();
+    if reply.is_empty() {
+        return Err(format!("Review API returned no text: {v}"));
+    }
+    Ok(reply.join("\n"))
+}
+
+impl ServerHandler for SpriteServer {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("sprite-factory", env!("CARGO_PKG_VERSION")))
+            .with_instructions(
+                "Sprite Factory makes 32×32 pixel-art sprites in one locked house style. Call style_guide once before authoring. \
+                 You describe shapes and materials; the renderer handles colour, light, outline and animation. Always look at the \
+                 returned image and revise. Before calling a sprite done, run blind_review on it.",
+            )
+    }
+
+    async fn list_tools(&self, _request: Option<PaginatedRequestParams>, _context: RequestContext<RoleServer>) -> Result<ListToolsResult, McpError> {
+        Ok(ListToolsResult::with_all_items(tools()))
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        tools().into_iter().find(|t| t.name == name)
+    }
+
+    async fn call_tool(&self, request: CallToolRequestParams, context: RequestContext<RoleServer>) -> Result<CallToolResponse, McpError> {
+        let args = request.arguments.clone().unwrap_or_default();
+        let this = self.clone();
+        let name = request.name.to_string();
+        let out: Result<CallToolResponse, String> = match name.as_str() {
+            "blind_review" => self.blind_review(&args, &request, &context).await,
+            "style_guide" => {
+                let guide = GUIDE.split("## Review loop").next().unwrap_or(GUIDE).to_string()
+                    + "## Review loop\nEvery create/edit returns the rendered sprite and its frames. Critique, then edit_sprite. Finish with blind_review.\n";
+                let pal: Map<String, Value> = Palette::new().iter().map(|(n, r)| (n.to_string(), json!(r.iter().map(|c| format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])).collect::<Vec<_>>()))).collect();
+                Ok(CallToolResult::success(vec![text(guide), text(format!("materials (shade 0→4): {}", Value::Object(pal)))]).into())
+            }
+            "get_sprite" => self.load(arg_str(&args, "name").unwrap_or_default()).map(|v| CallToolResult::success(vec![text(serde_json::to_string_pretty(&v).unwrap())]).into()),
+            "delete_sprite" => {
+                let n = arg_str(&args, "name").unwrap_or_default().to_string();
+                match self.load(&n) {
+                    Ok(_) => std::fs::remove_file(self.path(&n)).map(|_| CallToolResult::success(vec![text(format!("Deleted \"{n}\"."))]).into()).map_err(|e| e.to_string()),
+                    Err(e) => Err(e),
+                }
+            }
+            // CPU-bound tools run off the async executor
+            "list_sprites" | "create_sprite" | "edit_sprite" | "render_sprite" | "export_atlas" => {
+                let res = tokio::task::spawn_blocking(move || match name.as_str() {
+                    "list_sprites" => this.list_sprites(&args),
+                    "create_sprite" => this.create_sprite(&args),
+                    "edit_sprite" => this.edit_sprite(&args),
+                    "render_sprite" => {
+                        let n = arg_str(&args, "name").unwrap_or_default();
+                        let scale = args.get("scale").and_then(Value::as_u64).unwrap_or(8).clamp(1, 16) as usize;
+                        this.load(n).and_then(|v| render_result(&v, &format!("\"{n}\""), scale))
+                    }
+                    _ => this.export_atlas(&args),
+                })
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+                res.map(Into::into)
+            }
+            other => return Err(McpError::invalid_params(format!("unknown tool {other}"), None)),
+        };
+        Ok(out.unwrap_or_else(|msg| CallToolResult::error(vec![text(msg)]).into()))
+    }
+}
+

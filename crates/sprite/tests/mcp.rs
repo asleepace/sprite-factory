@@ -1,0 +1,193 @@
+//! Drives `sprite mcp` as a real MCP client over stdio and exercises each blind-review path:
+//! MRTR (protocol 2026-07-28), classic server→client sampling (2025-11-25), the direct API call
+//! (against a local mock of the Messages API) and the no-reviewer fallback.
+#![allow(deprecated)]
+
+use rmcp::model::*;
+use rmcp::service::{RequestContext, RunningService};
+use rmcp::transport::TokioChildProcess;
+use rmcp::{ClientHandler, ErrorData as McpError, RoleClient, ServiceExt};
+use serde_json::{json, Value};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use tokio::process::Command;
+
+#[derive(Clone, Default)]
+struct Reviewer {
+    sampling: bool,
+    version: Option<ProtocolVersion>,
+    calls: Arc<AtomicUsize>,
+}
+
+impl ClientHandler for Reviewer {
+    fn get_info(&self) -> ClientConfig {
+        let caps = if self.sampling { ClientCapabilities::builder().enable_sampling().build() } else { ClientCapabilities::default() };
+        let mut info = ClientConfig::new(caps, Implementation::new("test-reviewer", "0"));
+        if let Some(v) = &self.version {
+            info = info.with_protocol_version(v.clone());
+        }
+        info
+    }
+
+    async fn create_message(&self, params: CreateMessageRequestParams, _ctx: RequestContext<RoleClient>) -> Result<CreateMessageResult, McpError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let has_image = params.messages.iter().any(|m| m.content.iter().any(|c| matches!(c, SamplingMessageContentBlock::Image(_))));
+        assert!(has_image, "review request must carry the sheet image");
+        assert_eq!(params.include_context, Some(ContextInclusion::None), "reviewer must not see the conversation");
+        // scripted answers; the sheet is shuffled so only the plumbing and grading are checked
+        let reply = r#"[{"n":1,"guess":"teapot","conf":90,"alts":["kettle"]},{"n":2,"guess":"jar","conf":85,"alts":[]}]"#;
+        Ok(CreateMessageResult::new(SamplingMessage::assistant_text(reply), "stub".into()))
+    }
+}
+
+fn library() -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!("sprite-test-{}-{}", std::process::id(), rand_suffix()));
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+fn rand_suffix() -> u128 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+}
+
+async fn connect(r: Reviewer, lib: &std::path::Path, env: &[(&str, &str)]) -> RunningService<RoleClient, Reviewer> {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sprite"));
+    cmd.arg("mcp").arg("--library").arg(lib).env_remove("ANTHROPIC_API_KEY");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    r.serve(TokioChildProcess::new(cmd).unwrap()).await.expect("connect")
+}
+
+async fn call(c: &RunningService<RoleClient, Reviewer>, name: &'static str, args: Value) -> CallToolResult {
+    let mut p = CallToolRequestParams::new(name);
+    p.arguments = args.as_object().cloned();
+    c.call_tool(p).await.expect("call_tool")
+}
+
+fn text_of(r: &CallToolResult) -> String {
+    r.content.iter().filter_map(|c| if let ContentBlock::Text(t) = c { Some(t.text.clone()) } else { None }).collect::<Vec<_>>().join("\n")
+}
+
+async fn seed(c: &RunningService<RoleClient, Reviewer>) {
+    for (name, prims) in [
+        ("teapot", json!([{"t":"ellipse","c":[15.5,20],"r":[10.5,9],"m":"teal","gloss":true},{"t":"ellipse","c":[15.5,8],"r":2.4,"m":"gold"}])),
+        ("jar", json!([{"t":"rect","p":[8,8,24,29],"round":4,"m":"glass"},{"t":"rect","p":[9,4,23,9],"round":1,"m":"red","edge":true}])),
+    ] {
+        let r = call(c, "create_sprite", json!({"name": name, "category": "home", "prims": prims})).await;
+        assert_ne!(r.is_error, Some(true), "{}", text_of(&r));
+        assert!(r.content.iter().any(|c| matches!(c, ContentBlock::Image(_))), "create returns the rendered sprite");
+    }
+}
+
+#[tokio::test]
+async fn tools_and_editing() {
+    let lib = library();
+    let c = connect(Reviewer::default(), &lib, &[]).await;
+    let tools: Vec<String> = c.list_all_tools().await.unwrap().into_iter().map(|t| t.name.to_string()).collect();
+    for t in ["style_guide", "list_sprites", "get_sprite", "create_sprite", "edit_sprite", "render_sprite", "delete_sprite", "blind_review", "export_atlas"] {
+        assert!(tools.contains(&t.to_string()), "missing tool {t}");
+    }
+    seed(&c).await;
+    let dup = call(&c, "create_sprite", json!({"name": "jar", "category": "home", "prims": [{"t":"ellipse","c":[16,16],"r":8}]})).await;
+    assert_eq!(dup.is_error, Some(true));
+    let bad = call(&c, "create_sprite", json!({"name": "bad", "category": "misc", "prims": [{"t":"ellipse","c":[16,16],"r":8,"m":"plaid"}]})).await;
+    assert!(text_of(&bad).contains("unknown material"), "{}", text_of(&bad));
+    assert!(!lib.join("bad.json").exists(), "invalid specs are not saved");
+    let ed = call(&c, "edit_sprite", json!({"name": "jar", "prim_ops": [{"op": "merge", "index": 1, "prim": {"m": "blue"}}]})).await;
+    assert_ne!(ed.is_error, Some(true), "{}", text_of(&ed));
+    let got: Value = serde_json::from_str(&text_of(&call(&c, "get_sprite", json!({"name": "jar"})).await)).unwrap();
+    assert_eq!(got["prims"][1]["m"], "blue");
+    let oob = call(&c, "edit_sprite", json!({"name": "jar", "prim_ops": [{"op": "delete", "index": 9}]})).await;
+    assert_eq!(oob.is_error, Some(true));
+    let atlas = call(&c, "export_atlas", json!({"file": "home", "scale": 2})).await;
+    assert!(text_of(&atlas).contains("Exported 2 sprites"), "{}", text_of(&atlas));
+    assert!(lib.join("_export/home.json").exists());
+    let traversal = call(&c, "get_sprite", json!({"name": "../etc/passwd"})).await;
+    assert_eq!(traversal.is_error, Some(true));
+    c.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn blind_review_via_mrtr() {
+    let lib = library();
+    let r = Reviewer { sampling: true, version: Some(ProtocolVersion::V_2026_07_28), ..Default::default() };
+    let calls = r.calls.clone();
+    let c = connect(r, &lib, &[]).await;
+    seed(&c).await;
+    let out = call(&c, "blind_review", json!({"names": ["teapot", "jar"]})).await;
+    assert!(text_of(&out).contains("/2 passed"), "{}", text_of(&out));
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "client answered one input request");
+    c.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn blind_review_via_classic_sampling() {
+    let lib = library();
+    let r = Reviewer { sampling: true, version: Some(ProtocolVersion::V_2025_11_25), ..Default::default() };
+    let calls = r.calls.clone();
+    let c = connect(r, &lib, &[]).await;
+    seed(&c).await;
+    let out = call(&c, "blind_review", json!({"names": ["teapot", "jar"]})).await;
+    assert!(text_of(&out).contains("/2 passed"), "{}", text_of(&out));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    c.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn blind_review_fallback_without_reviewer() {
+    let lib = library();
+    let c = connect(Reviewer::default(), &lib, &[]).await;
+    seed(&c).await;
+    let out = call(&c, "blind_review", json!({"names": ["teapot", "jar"]})).await;
+    let t = text_of(&out);
+    assert!(t.contains("No reviewer is available") && t.contains("#1="), "{t}");
+    assert!(out.content.iter().any(|c| matches!(c, ContentBlock::Image(_))));
+    c.cancel().await.unwrap();
+}
+
+/// Minimal mock of POST /v1/messages that checks the request shape and returns a canned reply.
+fn mock_messages_api() -> (String, std::thread::JoinHandle<Value>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let h = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        let mut rd = BufReader::new(s.try_clone().unwrap());
+        let mut len = 0usize;
+        let mut headers = String::new();
+        loop {
+            let mut line = String::new();
+            rd.read_line(&mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                len = v.trim().parse().unwrap();
+            }
+            headers.push_str(&line);
+        }
+        let mut body = vec![0u8; len];
+        rd.read_exact(&mut body).unwrap();
+        let req: Value = serde_json::from_slice(&body).unwrap();
+        assert!(headers.to_ascii_lowercase().contains("x-api-key: test-key"));
+        let reply = json!({"content": [{"type": "text", "text": "[{\"n\":1,\"guess\":\"jar\",\"conf\":95},{\"n\":2,\"guess\":\"teapot\",\"conf\":95}]"}]}).to_string();
+        write!(s, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", reply.len(), reply).unwrap();
+        req
+    });
+    (url, h)
+}
+
+#[tokio::test]
+async fn blind_review_via_direct_api() {
+    let lib = library();
+    let (url, server) = mock_messages_api();
+    let c = connect(Reviewer { sampling: true, ..Default::default() }, &lib, &[("ANTHROPIC_API_KEY", "test-key"), ("ANTHROPIC_BASE_URL", &url), ("SPRITE_REVIEW_MODEL", "claude-test")]).await;
+    seed(&c).await;
+    let out = call(&c, "blind_review", json!({"names": ["teapot", "jar"]})).await;
+    assert!(text_of(&out).contains("/2 passed"), "{}", text_of(&out));
+    let req = server.join().unwrap();
+    assert_eq!(req["model"], "claude-test");
+    assert_eq!(req["messages"][0]["content"][0]["type"], "image");
+    c.cancel().await.unwrap();
+}

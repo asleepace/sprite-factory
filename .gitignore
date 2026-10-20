@@ -1,0 +1,10 @@
+target/
+node_modules/
+dist/
+__pycache__/
+out/
+/library/
+/prototype/library/
+/prototype/mcp/test/out/
+*.zip
+.DS_Store

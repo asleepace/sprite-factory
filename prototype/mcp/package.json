@@ -1,0 +1,27 @@
+{
+  "name": "sprite-factory-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for the Sprite Factory pixel-art pipeline",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "tsx src/server.ts",
+    "test": "tsx test/e2e.ts",
+    "import": "tsx scripts/import.ts"
+  },
+  "license": "ISC",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3"
+  },
+  "type": "module",
+  "bin": {
+    "sprite-factory-mcp": "dist/server.js"
+  }
+}

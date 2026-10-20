@@ -1,0 +1,174 @@
+<title>Sprite Factory Sampler</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Silkscreen&family=Atkinson+Hyperlegible:wght@400;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: a toolbar over a dense, square-cell catalogue; tapping a cell opens a spec drawer. */
+:root{
+  --bg:#e8ebf2; --panel:#f6f7fb; --cell:#fbfcfe; --ink:#1d2140; --muted:#5d6385;
+  --line:#cfd4e3; --accent:#d8343f; --accent-ink:#ffffff; --chip:#dde1ec;
+  --f-display:"Silkscreen", ui-monospace, monospace;
+  --f-body:"Atkinson Hyperlegible", system-ui, sans-serif;
+  --f-mono:"JetBrains Mono", ui-monospace, Menlo, monospace;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#141728; --panel:#1c2036; --cell:#22273f; --ink:#e7e9f5; --muted:#9aa0c2;
+  --line:#33395a; --accent:#ff5d68; --accent-ink:#1a0b0e; --chip:#2a2f4b; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#141728; --panel:#1c2036; --cell:#22273f; --ink:#e7e9f5; --muted:#9aa0c2;
+  --line:#33395a; --accent:#ff5d68; --accent-ink:#1a0b0e; --chip:#2a2f4b; color-scheme:dark}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font-family:var(--f-body);font-size:15px;line-height:1.5;
+  padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));padding-block:20px 48px}
+.wrap{max-width:1180px;margin:0 auto;display:flex;flex-direction:column;gap:18px}
+header{display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:12px}
+h1{font-family:var(--f-display);font-weight:400;font-size:clamp(22px,4vw,34px);line-height:1.1;margin:0;letter-spacing:.02em;text-wrap:balance}
+.sub{color:var(--muted);margin:4px 0 0;max-width:62ch}
+.spec{font-family:var(--f-mono);font-size:12px;color:var(--muted);display:flex;gap:14px;flex-wrap:wrap}
+.spec b{color:var(--ink);font-weight:600}
+.bar{position:sticky;top:env(safe-area-inset-top,0px);z-index:5;background:var(--bg);padding-block:8px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;border-bottom:1px solid var(--line)}
+body::before{content:"";position:fixed;inset:0 0 auto;height:env(safe-area-inset-top,0px);z-index:10;background:var(--bg)}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+button,.chip{font:inherit;font-size:13px;border:1px solid var(--line);background:var(--chip);color:var(--ink);border-radius:999px;padding:5px 12px;cursor:pointer}
+.chip[aria-pressed="true"]{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);font-weight:700}
+button:focus-visible,.chip:focus-visible,input:focus-visible,.tile:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.right{margin-left:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+input[type=search]{font:inherit;font-size:13px;border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:8px;padding:5px 10px;width:150px}
+.seg{display:flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.seg button{border:0;border-radius:0;background:var(--panel);padding:5px 10px;font-family:var(--f-mono);font-size:12px}
+.seg button[aria-pressed="true"]{background:var(--ink);color:var(--bg)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--cellw,148px),1fr));gap:8px}
+.tile{background:var(--cell);border:1px solid var(--line);border-radius:6px;display:flex;flex-direction:column;align-items:center;gap:6px;padding:12px 6px 8px;cursor:pointer;min-width:0}
+.tile:hover{border-color:var(--muted)}
+.spr{image-rendering:pixelated;image-rendering:crisp-edges;background-repeat:no-repeat}
+.tile .name{font-family:var(--f-display);font-size:11px;letter-spacing:.04em;text-transform:lowercase}
+.tile .meta{font-family:var(--f-mono);font-size:10px;color:var(--muted)}
+.count{font-family:var(--f-mono);font-size:12px;color:var(--muted)}
+dialog{border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:10px;padding:0;width:min(560px,calc(100vw - 32px));max-height:calc(100dvh - 40px)}
+dialog::backdrop{background:rgba(10,12,30,.45)}
+.dlg{display:flex;flex-direction:column;gap:14px;padding:18px}
+.dlg h2{font-family:var(--f-display);font-weight:400;margin:0;font-size:22px}
+.views{display:flex;gap:16px;align-items:flex-end;flex-wrap:wrap}
+.views figure{margin:0;display:flex;flex-direction:column;gap:4px;align-items:center}
+.views figcaption{font-family:var(--f-mono);font-size:10px;color:var(--muted)}
+.frames{overflow-x:auto;background:var(--cell);border:1px solid var(--line);border-radius:6px;padding:8px}
+.frames img{image-rendering:pixelated;height:64px;max-width:none}
+pre{margin:0;font-family:var(--f-mono);font-size:11px;line-height:1.45;background:var(--cell);border:1px solid var(--line);border-radius:6px;padding:10px;overflow:auto;max-height:240px;white-space:pre}
+.row{display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap}
+.pal{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:6px}
+.ramp{display:flex;flex-direction:column;gap:3px}
+.ramp .sw{display:flex;height:14px;border-radius:3px;overflow:hidden;border:1px solid var(--line)}
+.ramp .sw span{flex:1}
+.ramp small{font-family:var(--f-mono);font-size:10px;color:var(--muted)}
+h3{font-family:var(--f-display);font-weight:400;font-size:14px;margin:8px 0 0;letter-spacing:.04em}
+.note{color:var(--muted);font-size:13px;max-width:70ch;margin:0}
+@media (prefers-reduced-motion: reduce){.motion-note{display:inline}}
+.motion-note{display:none}
+</style>
+
+<div class="wrap">
+  <header>
+    <div>
+      <h1>Sprite Factory Sampler</h1>
+      <p class="sub">100 learning-game nouns, authored as shapes by an LLM and rendered by one fixed style rig. Every pixel, shade and outline comes from the factory, not the author.</p>
+    </div>
+    <div class="spec" id="spec"></div>
+  </header>
+
+  <div class="bar">
+    <div class="chips" id="chips" role="group" aria-label="Category"></div>
+    <div class="right">
+      <input type="search" id="q" placeholder="Find a noun" aria-label="Find a noun">
+      <div class="seg" role="group" aria-label="Zoom" id="zoom">
+        <button data-z="2" aria-pressed="false">2×</button><button data-z="3" aria-pressed="true">3×</button><button data-z="5" aria-pressed="false">5×</button>
+      </div>
+      <button id="play" aria-pressed="true">Pause</button>
+    </div>
+  </div>
+  <div class="count" id="count"></div>
+  <div class="grid" id="grid"></div>
+
+  <h3>Locked palette</h3>
+  <p class="note">24 materials × 5 shades. Authors pick a material; the light direction decides the shade. Shadows drift toward blue-violet and highlights toward yellow, which is what keeps 100 sprites looking like one set.</p>
+  <div class="pal" id="pal"></div>
+</div>
+
+<dialog id="dlg" aria-labelledby="dname">
+  <div class="dlg">
+    <div class="row"><h2 id="dname"></h2><button id="close">Close</button></div>
+    <div class="views" id="dviews"></div>
+    <div><div class="count">Animation frames</div><div class="frames" id="dframes"></div></div>
+    <div class="row"><div class="count" id="dmeta"></div><button id="copy">Copy spec</button></div>
+    <pre id="dspec"></pre>
+  </div>
+</dialog>
+
+<script>
+const DATA = /*DATA*/;
+const S = DATA.size;
+const state = {cat:"all", q:"", z:3, play:true};
+try{ const z = +localStorage.getItem("sf-zoom"); if([2,3,5].includes(z)) state.z = z; }catch(e){}
+if (matchMedia("(prefers-reduced-motion: reduce)").matches) state.play = false;
+
+const $ = s => document.querySelector(s);
+$("#spec").innerHTML = `<span><b>${DATA.sprites.length}</b> sprites</span><span><b>${S}×${S}</b> px</span><span><b>${DATA.palette_count}</b> colours</span><span><b>${DATA.frames_total}</b> frames</span>`;
+
+const cats = ["all", ...DATA.cats];
+$("#chips").innerHTML = cats.map(c => `<button class="chip" data-c="${c}" aria-pressed="${c===state.cat}">${c}</button>`).join("");
+$("#chips").addEventListener("click", e => { const b = e.target.closest(".chip"); if(!b) return; state.cat = b.dataset.c; render(); });
+$("#q").addEventListener("input", e => { state.q = e.target.value.trim().toLowerCase(); render(); });
+$("#zoom").addEventListener("click", e => { const b = e.target.closest("button"); if(!b) return; state.z = +b.dataset.z; try{localStorage.setItem("sf-zoom", state.z)}catch(_){} render(); });
+$("#play").addEventListener("click", () => { state.play = !state.play; syncPlay(); });
+function syncPlay(){ $("#play").textContent = state.play ? "Pause" : "Play"; $("#play").setAttribute("aria-pressed", state.play); }
+
+let tiles = [];
+function render(){
+  document.querySelectorAll(".chip").forEach(b => b.setAttribute("aria-pressed", b.dataset.c === state.cat));
+  document.querySelectorAll("#zoom button").forEach(b => b.setAttribute("aria-pressed", +b.dataset.z === state.z));
+  const list = DATA.sprites.filter(s => (state.cat==="all" || s.cat===state.cat) && (!state.q || s.name.replace(/_/g," ").includes(state.q)));
+  const px = S * state.z;
+  document.documentElement.style.setProperty("--cellw", Math.max(px + 28, 104) + "px");
+  $("#grid").innerHTML = list.map((s,i) => `
+    <button class="tile" data-i="${DATA.sprites.indexOf(s)}" aria-label="${s.name.replace(/_/g," ")}">
+      <div class="spr" style="width:${px}px;height:${px}px;background-image:url(${s.sheet});background-size:${px*s.frames}px ${px}px"></div>
+      <span class="name">${s.name.replace(/_/g," ")}</span>
+      <span class="meta">${s.anim} · ${s.frames}f · ${s.prims} shapes</span>
+    </button>`).join("");
+  tiles = [...document.querySelectorAll(".tile .spr")].map(el => ({el, s: DATA.sprites[+el.parentElement.dataset.i]}));
+  $("#count").textContent = `${list.length} of ${DATA.sprites.length}`;
+  draw(performance.now(), true);
+}
+let last = 0;
+function draw(t, force){
+  if(!state.play && !force) return;
+  const px = S * state.z;
+  for(const {el,s} of tiles){
+    const f = s.frames > 1 && state.play ? Math.floor(t / s.ms) % s.frames : 0;
+    el.style.backgroundPosition = `${-f*px}px 0`;
+  }
+}
+function loop(t){ if(state.play && t - last > 40){ draw(t); last = t; } requestAnimationFrame(loop); }
+requestAnimationFrame(loop);
+syncPlay();
+
+$("#grid").addEventListener("click", e => {
+  const b = e.target.closest(".tile"); if(!b) return;
+  const s = DATA.sprites[+b.dataset.i];
+  $("#dname").textContent = s.name.replace(/_/g," ");
+  $("#dviews").innerHTML = [1,2,4,8].map(k => `<figure><img class="spr" src="${s.first}" width="${S*k}" height="${S*k}" alt=""><figcaption>${k}×</figcaption></figure>`).join("");
+  $("#dframes").innerHTML = `<img src="${s.sheet}" alt="${s.frames} animation frames" style="width:${s.frames*64}px">`;
+  $("#dmeta").textContent = `${s.cat} · anim "${s.anim}" · ${s.prims} shapes · ${s.frames} frames`;
+  $("#dspec").textContent = s.spec;
+  $("#dlg").showModal();
+});
+$("#close").addEventListener("click", () => $("#dlg").close());
+$("#dlg").addEventListener("click", e => { if(e.target === $("#dlg")) $("#dlg").close(); });
+$("#copy").addEventListener("click", async () => {
+  try{ await navigator.clipboard.writeText($("#dspec").textContent); $("#copy").textContent = "Copied"; }
+  catch(_){ const r = document.createRange(); r.selectNodeContents($("#dspec")); getSelection().removeAllRanges(); getSelection().addRange(r); $("#copy").textContent = "Selected"; }
+  setTimeout(() => $("#copy").textContent = "Copy spec", 1400);
+});
+
+$("#pal").innerHTML = Object.entries(DATA.palette).map(([n,r]) =>
+  `<div class="ramp"><div class="sw">${r.map(c=>`<span style="background:rgb(${c.join(",")})"></span>`).join("")}</div><small>${n}</small></div>`).join("");
+render();
+</script>
