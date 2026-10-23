@@ -156,8 +156,8 @@ fn main() -> Result<()> {
         Cmd::Render { files, out, only } => {
             let specs = filtered(&files, &only)?;
             for (v, frames) in render_all(&specs, &pal, &opts)? {
-                let ms = v.get("ms").and_then(Value::as_u64).unwrap_or(110) as u32;
-                library::save_sprite_outputs(&out, library::spec_name(&v), &frames, ms)?;
+                let durations = library::frame_durations(&v, frames.len());
+                library::save_sprite_outputs(&out, library::spec_name(&v), &frames, &durations)?;
             }
             println!("rendered {} → {}", specs.len(), out.display());
         }
@@ -177,7 +177,9 @@ fn main() -> Result<()> {
                 imgio::write(&out.join(format!("{name}_hd{size}.png")), &first.png()?)?;
                 if frames.len() > 1 {
                     let bufs: Vec<&[u8]> = frames.iter().map(|f| f.px.as_slice()).collect();
-                    imgio::write(&out.join(format!("{name}_hd{size}.gif")), &imgio::gif_raw(&bufs, size, s.ms)?)?;
+                    let durations: Vec<u32> = (0..frames.len()).map(|i| s.frame_ms(i)).collect();
+                    let (gif, _) = imgio::encode_gif(&bufs, size, &durations, &imgio::GifOpts { scale: 1, ..Default::default() })?;
+                    imgio::write(&out.join(format!("{name}_hd{size}.gif")), &gif)?;
                 }
             }
             println!("rendered {} at {size}px → {}", parsed.len(), out.display());

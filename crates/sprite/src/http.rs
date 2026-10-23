@@ -34,8 +34,14 @@ pub struct ServeOpts {
     pub cors: Vec<String>,
 }
 
+/// A stored sprite's frames and how long each one shows (ms × hold).
+struct Rendered {
+    frames: Vec<Frame>,
+    durations: Vec<u32>,
+}
+
 /// sprite name → (hash of its spec file, rendered frames)
-type RenderCache = Arc<Mutex<HashMap<String, (u64, Arc<Vec<Frame>>)>>>;
+type RenderCache = Arc<Mutex<HashMap<String, (u64, Arc<Rendered>)>>>;
 
 #[derive(Clone)]
 struct AppState {
@@ -144,7 +150,7 @@ impl AppState {
     }
 
     /// Frames for a stored sprite, re-rendered only when its file changed.
-    fn frames(&self, name: &str) -> Result<(Value, u64, Arc<Vec<Frame>>), ApiError> {
+    fn frames(&self, name: &str) -> Result<(Value, u64, Arc<Rendered>), ApiError> {
         let (v, _, h) = self.read_spec(name)?;
         if let Some((ch, f)) = self.cache.lock().unwrap().get(name) {
             if *ch == h {
@@ -154,7 +160,9 @@ impl AppState {
         let pal = Palette::new();
         let spec = Spec::from_json(&v, &pal)
             .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, json!({"error": "invalid stored spec", "details": e})))?;
-        let f = Arc::new(render_anim(&spec, &pal, &RenderOpts::default()));
+        let frames = render_anim(&spec, &pal, &RenderOpts::default());
+        let durations = (0..frames.len()).map(|i| spec.frame_ms(i)).collect();
+        let f = Arc::new(Rendered { frames, durations });
         self.cache.lock().unwrap().insert(name.to_string(), (h, f.clone()));
         Ok((v, h, f))
     }
@@ -179,6 +187,7 @@ impl AppState {
 
 fn etag(parts: &[u64]) -> String {
     let mut h = std::collections::hash_map::DefaultHasher::new();
+    sprite_core::RENDER_VERSION.hash(&mut h);
     parts.hash(&mut h);
     format!("W/\"{:016x}\"", h.finish())
 }
@@ -202,10 +211,35 @@ fn qnum(q: &HashMap<String, String>, k: &str, default: usize, lo: usize, hi: usi
     q.get(k).and_then(|v| v.parse().ok()).unwrap_or(default).clamp(lo, hi)
 }
 
-fn png_of(frames: &[Frame], which: &str, scale: usize, frame: usize) -> Result<(Vec<u8>, &'static str), ApiError> {
+/// GIF options from the query string: ?scale=, ?bg=transparent|rrggbb, ?loop=pingpong, ?repeat=N.
+fn gif_opts(q: &HashMap<String, String>, scale: usize) -> Result<imgio::GifOpts, ApiError> {
+    let bad = |m: String| ApiError(StatusCode::BAD_REQUEST, json!({"error": m}));
+    let bg = imgio::parse_bg(q.get("bg").map(String::as_str).unwrap_or("")).map_err(bad)?;
+    let pingpong = match q.get("loop").map(String::as_str) {
+        None | Some("") | Some("forward") => false,
+        Some("pingpong") => true,
+        Some(o) => return Err(bad(format!("loop must be forward or pingpong, not {o:?}"))),
+    };
+    let repeat = match q.get("repeat") {
+        None => None,
+        Some(r) => Some(r.parse::<u16>().ok().filter(|&n| n >= 1).ok_or_else(|| bad("repeat must be a whole number from 1 to 65535 (omit it to loop forever)".into()))?),
+    };
+    Ok(imgio::GifOpts { scale, bg, pingpong, repeat })
+}
+
+/// The GIF options as one number for the ETag (0 for anything that isn't a GIF).
+fn gif_key(o: &imgio::GifOpts, kind: &str) -> u64 {
+    if kind != "gif" {
+        return 0;
+    }
+    let bg = o.bg.map_or(1 << 24, |c| u32::from_be_bytes([0, c[0], c[1], c[2]])) as u64;
+    bg | (o.pingpong as u64) << 25 | (o.repeat.map_or(0, |r| r as u64 + 1)) << 26
+}
+
+fn png_of(frames: &[Frame], which: &str, scale: usize, frame: usize, durations: &[u32], gif: &imgio::GifOpts) -> Result<(Vec<u8>, &'static str), ApiError> {
     let err = |e: anyhow::Error| ApiError(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()}));
     Ok(match which {
-        "gif" => (if frames.len() > 1 { imgio::gif(frames, scale, 110).map_err(err)? } else { imgio::gif(&frames[..1], scale, 110).map_err(err)? }, "image/gif"),
+        "gif" => (imgio::gif(frames, durations, gif).map_err(err)?.0, "image/gif"),
         "sheet" => (Rgba::strip(frames).scaled(scale).png().map_err(err)?, "image/png"),
         _ => {
             let f = &frames[frame.min(frames.len() - 1)];
@@ -252,7 +286,8 @@ async fn list(State(st): State<AppState>, Query(q): Query<HashMap<String, String
     Ok(Json(json!({"count": rows.len(), "sprites": rows})))
 }
 
-/// GET /v1/sprites/{name}.json | .png | .gif | .sheet.png   (?scale=1..16, ?frame=N for .png)
+/// GET /v1/sprites/{name}.json | .png | .gif | .sheet.png   (?scale=1..16, ?frame=N for .png;
+/// for .gif also ?bg=transparent|rrggbb, ?loop=forward|pingpong, ?repeat=N)
 async fn sprite_file(
     State(st): State<AppState>,
     UrlPath(file): UrlPath<String>,
@@ -277,14 +312,16 @@ async fn sprite_file(
     }
     let default_scale = if kind == "gif" { 4 } else { 1 };
     let scale = qnum(&q, "scale", default_scale, 1, 16);
-    let frame = qnum(&q, "frame", 0, 0, 255);
+    // the frame index only matters for a single PNG; GIF options only for a GIF
+    let frame = if kind == "png" { qnum(&q, "frame", 0, 0, 255) } else { 0 };
+    let gopts = if kind == "gif" { gif_opts(&q, scale)? } else { imgio::GifOpts { scale, ..Default::default() } };
     let res = tokio::task::spawn_blocking(move || -> Result<Response, ApiError> {
-        let (_, h, frames) = st.frames(&name)?;
-        let tag = etag(&[h, scale as u64, frame as u64, kind.len() as u64]);
+        let (_, h, r) = st.frames(&name)?;
+        let tag = etag(&[h, scale as u64, frame as u64, kind.len() as u64, gif_key(&gopts, kind)]);
         if headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) == Some(tag.as_str()) {
             return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, tag)]).into_response());
         }
-        let (bytes, ct) = png_of(&frames, kind, scale, frame)?;
+        let (bytes, ct) = png_of(&r.frames, kind, scale, frame, &r.durations, &gopts)?;
         Ok(cached(&headers, &tag, ct, bytes))
     })
     .await
@@ -323,7 +360,7 @@ async fn atlas(
                 continue;
             }
             parts.push(h);
-            picked.push((v, frames.as_ref().clone()));
+            picked.push((v, frames.frames.clone()));
         }
         if picked.is_empty() {
             return Err(ApiError(StatusCode::NOT_FOUND, json!({"error": "no sprites matched"})));
@@ -351,6 +388,7 @@ async fn render_adhoc(Query(q): Query<HashMap<String, String>>, body: Bytes) -> 
     let v: Value = serde_json::from_slice(&body).map_err(|e| ApiError(StatusCode::BAD_REQUEST, json!({"error": format!("body is not JSON: {e}")})))?;
     let format = q.get("format").cloned().unwrap_or_else(|| "png".into());
     let scale = qnum(&q, "scale", if format == "gif" { 4 } else { 1 }, 1, 16);
+    let gopts = if format == "gif" { gif_opts(&q, scale)? } else { imgio::GifOpts { scale, ..Default::default() } };
     tokio::task::spawn_blocking(move || -> Result<Response, ApiError> {
         let pal = Palette::new();
         let spec = Spec::from_json(&v, &pal)
@@ -364,7 +402,8 @@ async fn render_adhoc(Query(q): Query<HashMap<String, String>>, body: Bytes) -> 
             "sheet" => "sheet",
             _ => "png",
         };
-        let (bytes, ct) = png_of(&frames, kind, scale, 0)?;
+        let durations: Vec<u32> = (0..frames.len()).map(|i| spec.frame_ms(i)).collect();
+        let (bytes, ct) = png_of(&frames, kind, scale, 0, &durations, &gopts)?;
         Ok(([(header::CONTENT_TYPE, ct)], bytes).into_response())
     })
     .await

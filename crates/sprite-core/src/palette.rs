@@ -75,6 +75,31 @@ impl Palette {
     pub fn color_count(&self) -> usize {
         self.ramps.len() * 5
     }
+
+    /// The outer-outline colour for a material: its darkest shade pulled toward the shared ink.
+    pub fn outline(&self, idx: usize) -> Rgb {
+        let c = self.ramps[idx][0];
+        let mut out = [0u8; 3];
+        for ch in 0..3 {
+            out[ch] = (0.55 * c[ch] as f64 + 0.45 * INK[ch]) as u8;
+        }
+        out
+    }
+
+    /// Every colour the renderer can emit — all ramp shades plus every outline blend — deduplicated,
+    /// in a fixed order. At most 24×6 = 144 entries, so it fits an indexed (GIF) palette exactly:
+    /// no quantization, and the same palette for every frame and every sprite.
+    pub fn output_colors(&self) -> Vec<Rgb> {
+        let mut out: Vec<Rgb> = Vec::with_capacity(self.ramps.len() * 6);
+        for i in 0..self.ramps.len() {
+            for c in self.ramps[i].iter().copied().chain(std::iter::once(self.outline(i))) {
+                if !out.contains(&c) {
+                    out.push(c);
+                }
+            }
+        }
+        out
+    }
 }
 
 fn hex(h: &str) -> [f64; 3] {

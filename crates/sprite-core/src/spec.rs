@@ -117,6 +117,10 @@ pub struct Spec {
     pub anim: String,
     pub frames: usize,
     pub ms: u32,
+    /// per-frame hold, in units of `ms` (frame i shows for `ms * hold[i]`); missing entries are 1
+    pub hold: Vec<u32>,
+    /// round every dx/dy (preset and track) to whole sprite pixels, for crisp stepped motion
+    pub snap: bool,
     pub tracks: Vec<Track>,
     pub prims: Vec<Prim>,
     /// the original JSON, kept for round-tripping
@@ -198,6 +202,30 @@ impl Spec {
                 }
             }
         }
+        let frames = match num(o, "frames") {
+            None => crate::FRAMES,
+            Some(f) if f > crate::MAX_FRAMES as f64 => {
+                errs.push(format!("frames must be at most {} (got {f})", crate::MAX_FRAMES));
+                crate::MAX_FRAMES
+            }
+            Some(f) => f.max(1.0) as usize,
+        };
+        let mut hold = Vec::new();
+        match o.get("hold") {
+            None | Some(Value::Null) => {}
+            Some(Value::Array(a)) => {
+                if a.len() > frames {
+                    errs.push(format!("hold has {} entries but the loop has {frames} frames", a.len()));
+                }
+                for (k, h) in a.iter().enumerate() {
+                    match h.as_f64() {
+                        Some(x) if (1.0..=100.0).contains(&x) && x.fract() == 0.0 => hold.push(x as u32),
+                        _ => errs.push(format!("hold[{k}] must be a whole number from 1 to 100")),
+                    }
+                }
+            }
+            Some(_) => errs.push("hold must be an array of whole numbers, one per frame".into()),
+        }
         if !errs.is_empty() {
             return Err(errs);
         }
@@ -205,8 +233,10 @@ impl Spec {
             name,
             cat: o.get("cat").and_then(Value::as_str).map(str::to_string),
             anim,
-            frames: num(o, "frames").map(|f| f.max(1.0) as usize).unwrap_or(crate::FRAMES),
+            frames,
             ms: num(o, "ms").map(|f| f.max(16.0) as u32).unwrap_or(110),
+            hold,
+            snap: truthy(o.get("snap")),
             tracks,
             prims,
             raw: v.clone(),
@@ -215,6 +245,13 @@ impl Spec {
 
     pub fn is_animated(&self) -> bool {
         self.anim != "none" || !self.tracks.is_empty()
+    }
+
+    /// How long frame `i` is shown, in ms (`ms` × its hold). A still sprite renders one frame, so
+    /// `hold` doesn't apply to it.
+    pub fn frame_ms(&self, i: usize) -> u32 {
+        let hold = if self.is_animated() { self.hold.get(i).copied().unwrap_or(1) } else { 1 };
+        self.ms.saturating_mul(hold)
     }
 }
 

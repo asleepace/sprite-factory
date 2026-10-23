@@ -74,7 +74,24 @@ Extra `tracks` animate groups (`g`) — this is where personality comes from:
 ]
 ```
 `prop`: dx | dy | rot | sx | sy. `amp`: amount (px, degrees, or scale delta). `wave`: sin (default) | abs | abs2 | saw | square.
-`phase`: 0–1 offset. `pivot`: center | bottom | top | [x,y] | each. 8 frames per loop.
+`phase`: 0–1 offset. `pivot`: center | bottom | top | [x,y] | each.
+
+**`px` pixels are rigid stamps.** Touching px pixels in the same group form one stamp, which travels
+with the animation by whole pixels but never stretches, squashes or turns, so eyes and little patterns
+(hearts, sparkles) stay crisp in every frame. Two eyes are two stamps, so each follows its own spot on a
+turning or squashing head. A heart and the glint drawn on it touch, so they move as one. Scaling or
+rotating a px group moves its stamps around the pivot but doesn't resize or rotate them; draw the part
+with shapes if it should grow or turn.
+
+Timing (optional, top level):
+- `frames`: frames per loop (default 8, at most 64). `ms`: ms per frame (default 110, at least 16).
+- `hold`: per-frame multiplier of `ms`, e.g. `[3,1,1,1,3,1,1,1]` to linger on the poses. Missing entries
+  are 1; ignored on a sprite with no animation.
+- `snap: true`: rounds each part's total `dx`/`dy` to whole pixels, so motion is a clean pixel-art step
+  instead of a sub-pixel re-draw. Pair it with `"wave":"square"` or a small `amp` for a crisp bounce.
+
+`export_gif` turns a sprite into an animated GIF using the renderer's exact palette: transparent by
+default, timed from `ms`/`hold`, with optional `bg`, `pingpong` and `repeat`.
 
 ## Review loop (do this — it's the whole point)
 ```bash

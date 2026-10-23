@@ -53,7 +53,7 @@ fn rand_suffix() -> u128 {
 
 async fn connect(r: Reviewer, lib: &std::path::Path, env: &[(&str, &str)]) -> RunningService<RoleClient, Reviewer> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_sprite"));
-    cmd.arg("mcp").arg("--library").arg(lib).env_remove("ANTHROPIC_API_KEY");
+    cmd.arg("mcp").arg("--library").arg(lib).env_remove("ANTHROPIC_API_KEY").env_remove("SPRITE_PUBLIC_URL");
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -86,7 +86,7 @@ async fn tools_and_editing() {
     let lib = library();
     let c = connect(Reviewer::default(), &lib, &[]).await;
     let tools: Vec<String> = c.list_all_tools().await.unwrap().into_iter().map(|t| t.name.to_string()).collect();
-    for t in ["style_guide", "list_sprites", "get_sprite", "create_sprite", "edit_sprite", "render_sprite", "delete_sprite", "blind_review", "export_atlas"] {
+    for t in ["style_guide", "list_sprites", "get_sprite", "create_sprite", "edit_sprite", "render_sprite", "delete_sprite", "blind_review", "export_gif", "export_atlas"] {
         assert!(tools.contains(&t.to_string()), "missing tool {t}");
     }
     seed(&c).await;
@@ -101,6 +101,32 @@ async fn tools_and_editing() {
     assert_eq!(got["prims"][1]["m"], "blue");
     let oob = call(&c, "edit_sprite", json!({"name": "jar", "prim_ops": [{"op": "delete", "index": 9}]})).await;
     assert_eq!(oob.is_error, Some(true));
+    // timing fields round-trip through edit_sprite, and export_gif returns a real GIF inline
+    let ed = call(&c, "edit_sprite", json!({"name": "jar", "anim": "bob", "snap": true, "ms": 90, "hold": [2, 1, 1, 1, 2, 1, 1, 1]})).await;
+    assert_ne!(ed.is_error, Some(true), "{}", text_of(&ed));
+    let got: Value = serde_json::from_str(&text_of(&call(&c, "get_sprite", json!({"name": "jar"})).await)).unwrap();
+    assert_eq!((got["snap"].clone(), got["ms"].clone()), (json!(true), json!(90)));
+    let g = call(&c, "export_gif", json!({"name": "jar", "scale": 4, "pingpong": true})).await;
+    assert_ne!(g.is_error, Some(true), "{}", text_of(&g));
+    assert!(text_of(&g).contains("128×128px") && text_of(&g).contains("ping-pong"), "{}", text_of(&g));
+    let gif_b64 = g.content.iter().find_map(|c| match c {
+        ContentBlock::Image(i) if i.mime_type == "image/gif" => Some(i.data.clone()),
+        _ => None,
+    });
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, gif_b64.expect("an image/gif block")).unwrap();
+    assert_eq!(&bytes[..6], b"GIF89a");
+    assert!(lib.join("_export/jar.gif").exists());
+    let bad_bg = call(&c, "export_gif", json!({"name": "jar", "bg": "plaid"})).await;
+    assert_eq!(bad_bg.is_error, Some(true));
+    let big = call(&c, "export_gif", json!({"name": "jar", "scale": 99})).await;
+    assert!(text_of(&big).contains("scale must be"), "{}", text_of(&big));
+    // null puts a timing field back to its default
+    call(&c, "edit_sprite", json!({"name": "jar", "hold": null})).await;
+    let got: Value = serde_json::from_str(&text_of(&call(&c, "get_sprite", json!({"name": "jar"})).await)).unwrap();
+    assert!(got.get("hold").is_none());
+    assert!(!text_of(&g).contains("URL"), "no download link without SPRITE_PUBLIC_URL");
+    assert!(!text_of(&g).contains(lib.to_str().unwrap()), "server paths stay private");
+
     let atlas = call(&c, "export_atlas", json!({"file": "home", "scale": 2})).await;
     assert!(text_of(&atlas).contains("Exported 2 sprites"), "{}", text_of(&atlas));
     assert!(lib.join("_export/home.json").exists());
@@ -144,6 +170,18 @@ async fn blind_review_fallback_without_reviewer() {
     let t = text_of(&out);
     assert!(t.contains("No reviewer is available") && t.contains("#1="), "{t}");
     assert!(out.content.iter().any(|c| matches!(c, ContentBlock::Image(_))));
+    c.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn export_gif_links_to_the_public_url() {
+    let lib = library();
+    let c = connect(Reviewer::default(), &lib, &[("SPRITE_PUBLIC_URL", "https://sprites.example.com/")]).await;
+    seed(&c).await;
+    let g = call(&c, "export_gif", json!({"name": "teapot", "scale": 2, "bg": "#ffffff", "repeat": 3})).await;
+    let t = text_of(&g);
+    assert!(t.contains("https://sprites.example.com/v1/sprites/teapot.gif?scale=2&bg=ffffff&repeat=3"), "{t}");
+    assert!(t.contains("single still frame"), "an unanimated sprite says so: {t}");
     c.cancel().await.unwrap();
 }
 

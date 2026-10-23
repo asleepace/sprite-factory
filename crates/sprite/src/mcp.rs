@@ -53,11 +53,14 @@ pub(crate) type Reviews = Arc<Mutex<HashMap<String, (std::time::Instant, Vec<Str
 pub(crate) struct SpriteServer {
     lib: Arc<PathBuf>,
     reviews: Reviews,
+    /// where this server's REST API is reachable (SPRITE_PUBLIC_URL), for download links
+    public_url: Option<Arc<str>>,
 }
 
 impl SpriteServer {
     pub(crate) fn new(library: PathBuf, reviews: Reviews) -> Self {
-        SpriteServer { lib: Arc::new(library), reviews }
+        let public_url = std::env::var("SPRITE_PUBLIC_URL").ok().filter(|u| u.starts_with("http")).map(Arc::from);
+        SpriteServer { lib: Arc::new(library), reviews, public_url }
     }
 }
 
@@ -114,9 +117,32 @@ fn anim_schema() -> Value {
     json!({"type": "string", "enum": sprite_core::anim::PRESET_NAMES})
 }
 
+/// Timing fields shared by create_sprite and edit_sprite.
+fn timing_props() -> [(&'static str, Value); 4] {
+    [
+        ("frames", json!({"type": "integer", "minimum": 1, "maximum": sprite_core::MAX_FRAMES, "description": "frames per loop (default 8)"})),
+        ("ms", json!({"type": "integer", "minimum": 16, "description": "ms per frame (default 110)"})),
+        ("hold", json!({"type": "array", "items": {"type": "integer", "minimum": 1, "maximum": 100},
+            "description": "per-frame hold in units of ms, e.g. [3,1,1,1,3,1,1,1] lingers on the poses; missing entries are 1"})),
+        ("snap", json!({"type": "boolean", "description": "round dx/dy motion to whole pixels for crisp, stepped movement"})),
+    ]
+}
+
+const TIMING_KEYS: [&str; 4] = ["frames", "ms", "hold", "snap"];
+/// export_gif returns the GIF inline only up to this size, so a big one can't flood the context.
+const MAX_INLINE_GIF: usize = 1 << 20;
+
 fn obj(props: Value, required: &[&str]) -> Arc<Map<String, Value>> {
     let v = json!({"type": "object", "properties": props, "required": required});
     Arc::new(v.as_object().unwrap().clone())
+}
+
+fn with_timing(mut props: Value) -> Value {
+    let o = props.as_object_mut().unwrap();
+    for (k, v) in timing_props() {
+        o.insert(k.into(), v);
+    }
+    props
 }
 
 fn tools() -> Vec<Tool> {
@@ -130,7 +156,7 @@ fn tools() -> Vec<Tool> {
         t("get_sprite", "Get sprite spec", "Returns a sprite's JSON spec (useful as a reference for a related sprite).", obj(json!({"name": name_schema()}), &["name"])),
         t("create_sprite", "Create sprite",
             "Creates a sprite from shapes, renders it and saves it. Returns the sprite, its animation frames and style warnings. Keep shapes inside 1.5–30.5.",
-            obj(json!({
+            obj(with_timing(json!({
                 "name": name_schema(),
                 "category": {"type": "string", "enum": CATEGORIES},
                 "aka": {"type": "array", "items": {"type": "string"}, "description": "other words a child might use (bunny for rabbit); used by blind_review"},
@@ -138,10 +164,10 @@ fn tools() -> Vec<Tool> {
                 "tracks": {"type": "array", "items": track_schema()},
                 "prims": {"type": "array", "items": prim_schema(), "minItems": 1, "maxItems": 40},
                 "overwrite": {"type": "boolean"}
-            }), &["name", "category", "prims"])),
+            })), &["name", "category", "prims"])),
         t("edit_sprite", "Edit sprite",
             "Changes an existing sprite and re-renders it. prim_ops (set/merge/insert/delete by index, applied in order) for surgical edits, or prims to replace all shapes.",
-            obj(json!({
+            obj(with_timing(json!({
                 "name": name_schema(),
                 "anim": anim_schema(),
                 "tracks": {"type": "array", "items": track_schema()},
@@ -152,13 +178,24 @@ fn tools() -> Vec<Tool> {
                     "index": {"type": "integer", "minimum": 0},
                     "prim": {"type": "object", "description": "set/insert: full prim; merge: only the fields to change", "additionalProperties": true}
                 }, "required": ["op", "index"]}}
-            }), &["name"])),
+            })), &["name"])),
         t("render_sprite", "Render sprite", "Renders an existing sprite without changing it.",
             obj(json!({"name": name_schema(), "scale": {"type": "integer", "minimum": 1, "maximum": 16}}), &["name"])),
         t("delete_sprite", "Delete sprite", "Removes a sprite from the library. Cannot be undone.", obj(json!({"name": name_schema()}), &["name"])),
         t("blind_review", "Blind review",
             "Tests whether sprites are recognisable without their names: a fresh model sees an unlabeled, shuffled sheet and its guesses are graded. Uses ANTHROPIC_API_KEY if set, else MCP sampling, else returns the sheet and key for a separate reviewer.",
             obj(json!({"names": {"type": "array", "items": name_schema(), "minItems": 1, "maxItems": 30}}), &["names"])),
+        t("export_gif", "Export GIF",
+            "Renders a sprite as an animated GIF and returns it (plus a download URL when the server has a public address). \
+             Uses the renderer's exact palette, so colours never shift and the background can be truly transparent. \
+             Timing comes from the sprite's ms and hold. Also saved to the library's _export folder.",
+            obj(json!({
+                "name": name_schema(),
+                "scale": {"type": "integer", "minimum": 1, "maximum": 16, "description": "nearest-neighbour upscale (default 8 → 256px)"},
+                "bg": {"type": "string", "description": "\"transparent\" (default) or a hex colour like #f6f5f0"},
+                "pingpong": {"type": "boolean", "description": "play forward then backward instead of wrapping"},
+                "repeat": {"type": "integer", "minimum": 1, "description": "times to play; omit to loop forever"}
+            }), &["name"])),
         t("export_atlas", "Export atlas",
             "Packs sprites (all, a category, or named ones) into a PNG atlas + JSON frame map with animation timings (Phaser/Pixi JSON-hash style), written to the library's _export folder.",
             obj(json!({
@@ -304,6 +341,11 @@ impl SpriteServer {
             spec.insert("aka".into(), aka.clone());
         }
         spec.insert("anim".into(), a.get("anim").cloned().unwrap_or(json!("none")));
+        for k in TIMING_KEYS {
+            if let Some(x) = a.get(k).filter(|x| !x.is_null()) {
+                spec.insert(k.into(), x.clone());
+            }
+        }
         spec.insert("tracks".into(), a.get("tracks").cloned().unwrap_or(json!([])));
         spec.insert("prims".into(), a.get("prims").cloned().unwrap_or(json!([])));
         let v = Value::Object(spec);
@@ -319,6 +361,18 @@ impl SpriteServer {
         for k in ["anim", "tracks", "aka", "prims"] {
             if let Some(x) = a.get(k) {
                 o.insert(k.into(), x.clone());
+            }
+        }
+        for k in TIMING_KEYS {
+            match a.get(k) {
+                // null puts a timing field back to its default
+                Some(Value::Null) => {
+                    o.remove(k);
+                }
+                Some(x) => {
+                    o.insert(k.into(), x.clone());
+                }
+                None => {}
             }
         }
         if let Some(ops) = a.get("prim_ops").and_then(Value::as_array) {
@@ -355,6 +409,77 @@ impl SpriteServer {
         let res = render_result(&v, &format!("Updated \"{name}\"."), 8)?;
         self.save(&v)?;
         Ok(res)
+    }
+
+    fn export_gif(&self, a: &Map<String, Value>) -> ToolOut {
+        let name = arg_str(a, "name").unwrap_or_default();
+        let v = self.load(name)?;
+        let (spec, frames) = render_spec(&v).map_err(|e| format!("\"{name}\" has an invalid spec:\n- {}", e.join("\n- ")))?;
+        let scale = match a.get("scale") {
+            None | Some(Value::Null) => 8,
+            Some(v) => v.as_u64().filter(|s| (1..=16).contains(s)).ok_or("scale must be a whole number from 1 to 16")? as usize,
+        };
+        let bg_arg = arg_str(a, "bg").unwrap_or("transparent");
+        let bg = imgio::parse_bg(bg_arg)?;
+        let pingpong = a.get("pingpong").and_then(Value::as_bool).unwrap_or(false);
+        let repeat = match a.get("repeat") {
+            None | Some(Value::Null) => None,
+            Some(r) => Some(r.as_u64().filter(|&n| (1..=u16::MAX as u64).contains(&n)).ok_or("repeat must be a whole number from 1 to 65535")? as u16),
+        };
+        let opts = imgio::GifOpts { scale, bg, pingpong, repeat };
+        let durations: Vec<u32> = (0..frames.len()).map(|i| spec.frame_ms(i)).collect();
+        let (gif, info) = imgio::gif(&frames, &durations, &opts).map_err(|e| e.to_string())?;
+
+        let dir = self.lib.join("_export");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let path = dir.join(format!("{name}.gif"));
+        std::fs::write(&path, &gif).map_err(|e| e.to_string())?;
+
+        let mut lines = vec![format!(
+            "GIF for \"{name}\": {side}×{side}px, {n} frame{s} ({src} rendered), {ms} ms per loop{bg}{pp}{rep}, {kb:.1} KB.",
+            side = info.side,
+            n = info.frames,
+            s = if info.frames == 1 { "" } else { "s" },
+            src = frames.len(),
+            ms = info.loop_ms,
+            bg = if bg.is_some() { format!(", background {bg_arg}") } else { ", transparent".into() },
+            pp = if pingpong { ", ping-pong" } else { "" },
+            rep = repeat.map(|r| format!(", plays {r}×")).unwrap_or_default(),
+            kb = gif.len() as f64 / 1024.0,
+        )];
+        if !spec.is_animated() {
+            lines.push("This sprite isn't animated, so the GIF is a single still frame. Give it an anim or tracks to animate it.".into());
+        }
+        if let Some(base) = &self.public_url {
+            let mut q = vec![format!("scale={scale}")];
+            if let Some(c) = bg {
+                q.push(format!("bg={:02x}{:02x}{:02x}", c[0], c[1], c[2]));
+            }
+            if pingpong {
+                q.push("loop=pingpong".into());
+            }
+            if let Some(r) = repeat {
+                q.push(format!("repeat={r}"));
+            }
+            lines.push(format!(
+                "URL (needs your token as a Bearer header or &key=…): {}/v1/sprites/{name}.gif?{}",
+                base.trim_end_matches('/'),
+                q.join("&")
+            ));
+        }
+        lines.push(format!("Saved to _export/{name}.gif in the sprite library."));
+        let mut content = vec![];
+        if gif.len() <= MAX_INLINE_GIF {
+            content.push(ContentBlock::image(base64::engine::general_purpose::STANDARD.encode(&gif), "image/gif"));
+        } else {
+            lines.push(format!(
+                "At {:.0} KB it's too big to return inline (limit {} KB); use the URL, or a smaller scale or fewer frames.",
+                gif.len() as f64 / 1024.0,
+                MAX_INLINE_GIF / 1024
+            ));
+        }
+        content.insert(0, text(lines.join("\n")));
+        Ok(CallToolResult::success(content))
     }
 
     fn export_atlas(&self, a: &Map<String, Value>) -> ToolOut {
@@ -631,11 +756,12 @@ impl ServerHandler for SpriteServer {
                 }
             }
             // CPU-bound tools run off the async executor
-            "list_sprites" | "create_sprite" | "edit_sprite" | "render_sprite" | "export_atlas" => {
+            "list_sprites" | "create_sprite" | "edit_sprite" | "render_sprite" | "export_gif" | "export_atlas" => {
                 let res = tokio::task::spawn_blocking(move || match name.as_str() {
                     "list_sprites" => this.list_sprites(&args),
                     "create_sprite" => this.create_sprite(&args),
                     "edit_sprite" => this.edit_sprite(&args),
+                    "export_gif" => this.export_gif(&args),
                     "render_sprite" => {
                         let n = arg_str(&args, "name").unwrap_or_default();
                         let scale = args.get("scale").and_then(Value::as_u64).unwrap_or(8).clamp(1, 16) as usize;

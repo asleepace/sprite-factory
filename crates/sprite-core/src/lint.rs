@@ -4,7 +4,7 @@ use serde::Serialize;
 use std::collections::HashSet;
 
 use crate::render::Frame;
-use crate::spec::Spec;
+use crate::spec::{Kind, Prop, Spec};
 use crate::SIZE;
 
 #[derive(Debug, Clone, Serialize)]
@@ -54,6 +54,21 @@ pub fn lint(spec: &Spec, frames: &[Frame]) -> Lint {
     }
     if colors.len() < 6 {
         warnings.push(format!("only {} colours; sprite may look flat — vary materials or shading", colors.len()));
+    }
+    for (k, t) in spec.tracks.iter().enumerate() {
+        let Some(g) = t.g.as_deref() else { continue };
+        if !matches!(t.prop, Prop::Rot | Prop::Sx | Prop::Sy) {
+            continue;
+        }
+        if spec.prims.iter().any(|p| p.kind == Kind::Px && p.g.as_deref() == Some(g)) {
+            warnings.push(format!(
+                "tracks[{k}] {} group {g:?}, which has px pixels. px are rigid stamps: they travel with the group but \
+                 never {} themselves. Draw that part with shapes if it should {}.",
+                if t.prop == Prop::Rot { "rotates" } else { "scales" },
+                if t.prop == Prop::Rot { "turn" } else { "grow or shrink" },
+                if t.prop == Prop::Rot { "turn" } else { "change size" },
+            ));
+        }
     }
     Lint { warnings, bbox: [x0, y0, x1, y1], span_px: span, colors: colors.len(), frames: frames.len(), prims: spec.prims.len() }
 }

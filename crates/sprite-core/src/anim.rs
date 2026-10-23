@@ -63,6 +63,9 @@ pub fn frame_transforms(spec: &Spec, t: f64) -> Vec<Mat> {
     let prims = &spec.prims;
     let mut g_mat = I3;
     let mut local = vec![I3; prims.len()];
+    // with `snap`, translations are summed here and applied (rounded) after everything else
+    let mut g_shift = [0.0f64; 2];
+    let mut l_shift = vec![[0.0f64; 2]; prims.len()];
     for trk in &tracks {
         let idxs: Vec<usize> = match &trk.g {
             None => (0..prims.len()).collect(),
@@ -72,6 +75,17 @@ pub fn frame_transforms(spec: &Spec, t: f64) -> Vec<Mat> {
             continue;
         }
         let v = trk.amp * wave(trk.wave, (t + trk.phase).rem_euclid(1.0));
+        if spec.snap && matches!(trk.prop, Prop::Dx | Prop::Dy) {
+            let axis = if trk.prop == Prop::Dx { 0 } else { 1 };
+            if trk.g.is_none() {
+                g_shift[axis] += v;
+            } else {
+                for &i in &idxs {
+                    l_shift[i][axis] += v;
+                }
+            }
+            continue;
+        }
         let mk = |pivot: [f64; 2]| match trk.prop {
             Prop::Dx => affine(0.0, 1.0, 1.0, v, 0.0, pivot),
             Prop::Dy => affine(0.0, 1.0, 1.0, 0.0, v, pivot),
@@ -89,6 +103,17 @@ pub fn frame_transforms(spec: &Spec, t: f64) -> Vec<Mat> {
             let m = mk(resolve_pivot(&trk.pivot, idxs.iter().map(|&i| &prims[i])));
             for &i in &idxs {
                 local[i] = mul(&m, &local[i]);
+            }
+        }
+    }
+    if spec.snap {
+        // round each prim's *total* shift, so group motion stays on the same pixel grid as the body
+        let g = [g_shift[0].round(), g_shift[1].round()];
+        g_mat = mul(&affine(0.0, 1.0, 1.0, g[0], g[1], [0.0, 0.0]), &g_mat);
+        for (l, s) in local.iter_mut().zip(&l_shift) {
+            let d = [(g_shift[0] + s[0]).round() - g[0], (g_shift[1] + s[1]).round() - g[1]];
+            if d != [0.0, 0.0] {
+                *l = mul(&affine(0.0, 1.0, 1.0, d[0], d[1], [0.0, 0.0]), l);
             }
         }
     }

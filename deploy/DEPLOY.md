@@ -35,6 +35,9 @@ This creates the `sprite` system user, `/etc/sprite/{sprite.env,tokens}` and `/v
 
 Edit `/etc/sprite/sprite.env` if your hostname isn't `sprites.asleepace.com`, then `sudo systemctl restart sprite`.
 
+Upgrading an older install? The installer never overwrites `sprite.env`, so add
+`SPRITE_PUBLIC_URL=https://sprites.asleepace.com` yourself if you want `export_gif` to include download links.
+
 ## 4. nginx + TLS
 ```bash
 sudo cp deploy/nginx-sprites.conf /etc/nginx/sites-available/sprites.asleepace.com
@@ -83,7 +86,7 @@ For a prototype served from a dev origin that reads pixels (canvas), add that or
 | `GET /healthz` | no auth |
 | `GET /v1/sprites?category=` | names, categories, frame counts, asset URLs |
 | `GET /v1/sprites/{name}.png` | `?scale=1..16&frame=N` |
-| `GET /v1/sprites/{name}.gif` | animated, `?scale=` (default 4) |
+| `GET /v1/sprites/{name}.gif` | animated, timed from the spec's `ms`/`hold`; `?scale=` (default 4), `?bg=transparent\|rrggbb`, `?loop=forward\|pingpong`, `?repeat=N` |
 | `GET /v1/sprites/{name}.sheet.png` | all frames in a row |
 | `GET /v1/sprites/{name}.json` | the spec |
 | `GET /v1/atlas.png`, `/v1/atlas.json` | `?category=`, `?names=a,b`, `?scale=1..8` |

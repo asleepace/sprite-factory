@@ -42,6 +42,14 @@ pub fn spec_name(v: &Value) -> &str {
     v.get("name").and_then(Value::as_str).unwrap_or("sprite")
 }
 
+/// ms per frame for a stored spec (its `ms` × `hold`), falling back to 110 ms if it won't parse.
+pub fn frame_durations(v: &Value, n: usize) -> Vec<u32> {
+    match sprite_core::Spec::from_json(v, &sprite_core::Palette::new()) {
+        Ok(s) => (0..n).map(|i| s.frame_ms(i)).collect(),
+        Err(_) => vec![110; n],
+    }
+}
+
 /// Pack every frame of every sprite into one PNG + a Phaser/Pixi JSON-hash frame map.
 pub fn atlas(sprites: &[(Value, Vec<Frame>)], scale: usize, image_name: &str) -> Result<(Rgba, Value)> {
     let cols = sprites.iter().map(|s| s.1.len()).max().unwrap_or(1);
@@ -62,7 +70,12 @@ pub fn atlas(sprites: &[(Value, Vec<Frame>)], scale: usize, image_name: &str) ->
         }
         anims.insert(
             name.to_string(),
-            json!({"frames": keys, "frameMs": spec.get("ms").and_then(Value::as_u64).unwrap_or(110), "category": spec.get("cat")}),
+            json!({
+                "frames": keys,
+                "frameMs": spec.get("ms").and_then(Value::as_u64).unwrap_or(110),
+                "durations": frame_durations(spec, fr.len()),
+                "category": spec.get("cat"),
+            }),
         );
     }
     let img = if scale > 1 { img.scaled(scale) } else { img };
@@ -74,13 +87,14 @@ pub fn atlas(sprites: &[(Value, Vec<Frame>)], scale: usize, image_name: &str) ->
     Ok((img, meta))
 }
 
-pub fn save_sprite_outputs(dir: &Path, name: &str, frames: &[Frame], ms: u32) -> Result<()> {
+pub fn save_sprite_outputs(dir: &Path, name: &str, frames: &[Frame], durations: &[u32]) -> Result<()> {
     let mut first = Rgba::new(SIZE, SIZE);
     first.blit_frame(&frames[0], 0, 0, 1);
     imgio::write(&dir.join(format!("{name}.png")), &first.png()?)?;
     imgio::write(&dir.join(format!("{name}_sheet.png")), &Rgba::strip(frames).png()?)?;
     if frames.len() > 1 {
-        imgio::write(&dir.join(format!("{name}.gif")), &imgio::gif(frames, 6, ms)?)?;
+        let (gif, _) = imgio::gif(frames, durations, &imgio::GifOpts { scale: 6, ..Default::default() })?;
+        imgio::write(&dir.join(format!("{name}.gif")), &gif)?;
     }
     Ok(())
 }
