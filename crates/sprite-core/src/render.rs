@@ -1,10 +1,10 @@
 //! Spec → RGBA frames. Mirrors factory.py step for step.
 
 use crate::anim::frame_transforms;
-use crate::geom::{affine, apply, mul, prim_outline, Outline};
-use crate::palette::{Palette, INK};
+use crate::geom::{affine, apply, mul, prim_outline, Mat, Outline};
+use crate::palette::Palette;
 use crate::raster::{edt, fill_polygon, gaussian, gradient, stroke, Mask};
-use crate::spec::{Kind, Spec};
+use crate::spec::{Kind, Prim, Spec};
 use crate::{SIZE, SS};
 
 /// One 32×32 RGBA frame, row-major.
@@ -323,16 +323,21 @@ fn render_sized(spec: &Spec, t: f64, pal: &Palette, opts: &RenderOpts, size: usi
         rgba[q * 4 + 3] = 255;
     }
 
-    // ── pixel overrides (eyes, glints): one pixel at 32px; a round dot of the same footprint in HD
+    // ── pixel overrides (eyes, glints): one pixel at 32px; a round dot of the same footprint in HD.
+    // px prims are stamps: each moves as one rigid block by a whole-pixel offset, so a pattern
+    // (an eye, a heart) never tears under scale or rotation. The offset is where the frame's
+    // transform carries the anchor (the centroid of every px prim in the same group), so a heart
+    // and its glint share it and stay locked together.
     let px_label = prims.len() as i32 + 1;
+    let deltas = px_offsets(prims, &pm);
     for (i, p) in prims.iter().enumerate() {
         if p.kind != Kind::Px {
             continue;
         }
         let col = pal.ramp(p.m)[p.shade as usize];
+        let [ddx, ddy] = deltas[i];
         for qp in &p.pts {
-            let a = apply(&pm[i], *qp);
-            let (xi, yi) = (a[0].floor(), a[1].floor());
+            let (xi, yi) = ((qp[0] + ddx).floor(), (qp[1] + ddy).floor());
             if !(xi >= 0.0 && yi >= 0.0 && xi < 32.0 && yi < 32.0) {
                 continue;
             }
@@ -381,17 +386,53 @@ fn render_sized(spec: &Spec, t: f64, pal: &Palette, opts: &RenderOpts, size: usi
                 }
                 let li = lab[q];
                 let m = if li > 0 && (li as usize) <= prims.len() { prims[(li - 1) as usize].m } else { black };
-                let c = pal.ramp(m)[0];
                 let d = at(x, y);
-                for ch in 0..3 {
-                    rgba[d * 4 + ch] = (0.55 * c[ch] as f64 + 0.45 * INK[ch]) as u8;
-                }
+                rgba[d * 4..d * 4 + 3].copy_from_slice(&pal.outline(m));
                 rgba[d * 4 + 3] = 255;
                 break;
             }
         }
     }
     rgba
+}
+
+/// Whole-pixel offset for each px prim this frame (zero for other prims). Prims in the same
+/// group share an anchor; ungrouped px prims share one too. A prim with its own transform
+/// (pivot "each") still uses its own matrix, applied to the shared anchor.
+fn px_offsets(prims: &[Prim], pm: &[Mat]) -> Vec<[f64; 2]> {
+    let mut sums: Vec<(Option<&str>, [f64; 2], usize)> = Vec::new();
+    for p in prims.iter().filter(|p| p.kind == Kind::Px) {
+        let key = p.g.as_deref();
+        let slot = match sums.iter().position(|s| s.0 == key) {
+            Some(k) => k,
+            None => {
+                sums.push((key, [0.0; 2], 0));
+                sums.len() - 1
+            }
+        };
+        for q in &p.pts {
+            // pixel centres, so a 1-px stamp's anchor is the middle of that pixel
+            sums[slot].1[0] += q[0].floor() + 0.5;
+            sums[slot].1[1] += q[1].floor() + 0.5;
+            sums[slot].2 += 1;
+        }
+    }
+    prims
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            if p.kind != Kind::Px {
+                return [0.0; 2];
+            }
+            let Some((_, s, n)) = sums.iter().find(|s| s.0 == p.g.as_deref()) else { return [0.0; 2] };
+            if *n == 0 {
+                return [0.0; 2];
+            }
+            let anchor = [s[0] / *n as f64, s[1] / *n as f64];
+            let a = apply(&pm[i], anchor);
+            [(a[0] - anchor[0]).round(), (a[1] - anchor[1]).round()]
+        })
+        .collect()
 }
 
 /// Offsets within radius `r`, nearest first. r = 1 is the classic 4-neighbourhood (down, right,

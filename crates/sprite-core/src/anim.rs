@@ -71,7 +71,10 @@ pub fn frame_transforms(spec: &Spec, t: f64) -> Vec<Mat> {
         if idxs.is_empty() {
             continue;
         }
-        let v = trk.amp * wave(trk.wave, (t + trk.phase).rem_euclid(1.0));
+        let mut v = trk.amp * wave(trk.wave, (t + trk.phase).rem_euclid(1.0));
+        if spec.snap && matches!(trk.prop, Prop::Dx | Prop::Dy) {
+            v = v.round();
+        }
         let mk = |pivot: [f64; 2]| match trk.prop {
             Prop::Dx => affine(0.0, 1.0, 1.0, v, 0.0, pivot),
             Prop::Dy => affine(0.0, 1.0, 1.0, 0.0, v, pivot),

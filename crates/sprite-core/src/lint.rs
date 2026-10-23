@@ -4,7 +4,7 @@ use serde::Serialize;
 use std::collections::HashSet;
 
 use crate::render::Frame;
-use crate::spec::Spec;
+use crate::spec::{Kind, Prop, Spec};
 use crate::SIZE;
 
 #[derive(Debug, Clone, Serialize)]
@@ -54,6 +54,22 @@ pub fn lint(spec: &Spec, frames: &[Frame]) -> Lint {
     }
     if colors.len() < 6 {
         warnings.push(format!("only {} colours; sprite may look flat — vary materials or shading", colors.len()));
+    }
+    for (k, t) in spec.tracks.iter().enumerate() {
+        let Some(g) = t.g.as_deref() else { continue };
+        if !matches!(t.prop, Prop::Rot | Prop::Sx | Prop::Sy) {
+            continue;
+        }
+        let members: Vec<_> = spec.prims.iter().filter(|p| p.g.as_deref() == Some(g)).collect();
+        if members.iter().any(|p| p.kind == Kind::Px) {
+            let only_px = members.iter().all(|p| p.kind == Kind::Px);
+            warnings.push(format!(
+                "tracks[{k}] {}s group {g:?}, but px pixels are rigid stamps: they only follow where the group moves, never \
+                 stretch or turn.{} Animate px with dx/dy, or draw the part with shapes if it should scale.",
+                if t.prop == Prop::Rot { "rotate" } else { "scale" },
+                if only_px { " On a px-only group this usually does nothing." } else { "" }
+            ));
+        }
     }
     Lint { warnings, bbox: [x0, y0, x1, y1], span_px: span, colors: colors.len(), frames: frames.len(), prims: spec.prims.len() }
 }

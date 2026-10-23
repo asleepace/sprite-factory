@@ -202,10 +202,26 @@ fn qnum(q: &HashMap<String, String>, k: &str, default: usize, lo: usize, hi: usi
     q.get(k).and_then(|v| v.parse().ok()).unwrap_or(default).clamp(lo, hi)
 }
 
-fn png_of(frames: &[Frame], which: &str, scale: usize, frame: usize) -> Result<(Vec<u8>, &'static str), ApiError> {
+/// GIF options from the query string: ?scale=, ?bg=transparent|rrggbb, ?loop=pingpong, ?repeat=N.
+fn gif_opts(q: &HashMap<String, String>, scale: usize) -> Result<imgio::GifOpts, ApiError> {
+    let bad = |m: String| ApiError(StatusCode::BAD_REQUEST, json!({"error": m}));
+    let bg = imgio::parse_bg(q.get("bg").map(String::as_str).unwrap_or("")).map_err(bad)?;
+    let pingpong = match q.get("loop").map(String::as_str) {
+        None | Some("") | Some("forward") => false,
+        Some("pingpong") => true,
+        Some(o) => return Err(bad(format!("loop must be forward or pingpong, not {o:?}"))),
+    };
+    let repeat = match q.get("repeat") {
+        None => None,
+        Some(r) => Some(r.parse::<u16>().ok().filter(|&n| n >= 1).ok_or_else(|| bad("repeat must be a whole number ≥ 1 (omit it to loop forever)".into()))?),
+    };
+    Ok(imgio::GifOpts { scale, bg, pingpong, repeat })
+}
+
+fn png_of(frames: &[Frame], which: &str, scale: usize, frame: usize, durations: &[u32], gif: &imgio::GifOpts) -> Result<(Vec<u8>, &'static str), ApiError> {
     let err = |e: anyhow::Error| ApiError(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()}));
     Ok(match which {
-        "gif" => (if frames.len() > 1 { imgio::gif(frames, scale, 110).map_err(err)? } else { imgio::gif(&frames[..1], scale, 110).map_err(err)? }, "image/gif"),
+        "gif" => (imgio::gif(frames, durations, gif).map_err(err)?.0, "image/gif"),
         "sheet" => (Rgba::strip(frames).scaled(scale).png().map_err(err)?, "image/png"),
         _ => {
             let f = &frames[frame.min(frames.len() - 1)];
@@ -252,7 +268,8 @@ async fn list(State(st): State<AppState>, Query(q): Query<HashMap<String, String
     Ok(Json(json!({"count": rows.len(), "sprites": rows})))
 }
 
-/// GET /v1/sprites/{name}.json | .png | .gif | .sheet.png   (?scale=1..16, ?frame=N for .png)
+/// GET /v1/sprites/{name}.json | .png | .gif | .sheet.png   (?scale=1..16, ?frame=N for .png;
+/// for .gif also ?bg=transparent|rrggbb, ?loop=forward|pingpong, ?repeat=N)
 async fn sprite_file(
     State(st): State<AppState>,
     UrlPath(file): UrlPath<String>,
@@ -278,13 +295,16 @@ async fn sprite_file(
     let default_scale = if kind == "gif" { 4 } else { 1 };
     let scale = qnum(&q, "scale", default_scale, 1, 16);
     let frame = qnum(&q, "frame", 0, 0, 255);
+    let gopts = gif_opts(&q, scale)?;
     let res = tokio::task::spawn_blocking(move || -> Result<Response, ApiError> {
-        let (_, h, frames) = st.frames(&name)?;
-        let tag = etag(&[h, scale as u64, frame as u64, kind.len() as u64]);
+        let (v, h, frames) = st.frames(&name)?;
+        let g = if kind == "gif" { hash_bytes(format!("{gopts:?}").as_bytes()) } else { 0 };
+        let tag = etag(&[h, scale as u64, frame as u64, kind.len() as u64, g]);
         if headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) == Some(tag.as_str()) {
             return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, tag)]).into_response());
         }
-        let (bytes, ct) = png_of(&frames, kind, scale, frame)?;
+        let durations = library::frame_durations(&v, frames.len());
+        let (bytes, ct) = png_of(&frames, kind, scale, frame, &durations, &gopts)?;
         Ok(cached(&headers, &tag, ct, bytes))
     })
     .await
@@ -351,6 +371,7 @@ async fn render_adhoc(Query(q): Query<HashMap<String, String>>, body: Bytes) -> 
     let v: Value = serde_json::from_slice(&body).map_err(|e| ApiError(StatusCode::BAD_REQUEST, json!({"error": format!("body is not JSON: {e}")})))?;
     let format = q.get("format").cloned().unwrap_or_else(|| "png".into());
     let scale = qnum(&q, "scale", if format == "gif" { 4 } else { 1 }, 1, 16);
+    let gopts = gif_opts(&q, scale)?;
     tokio::task::spawn_blocking(move || -> Result<Response, ApiError> {
         let pal = Palette::new();
         let spec = Spec::from_json(&v, &pal)
@@ -364,7 +385,8 @@ async fn render_adhoc(Query(q): Query<HashMap<String, String>>, body: Bytes) -> 
             "sheet" => "sheet",
             _ => "png",
         };
-        let (bytes, ct) = png_of(&frames, kind, scale, 0)?;
+        let durations: Vec<u32> = (0..frames.len()).map(|i| spec.frame_ms(i)).collect();
+        let (bytes, ct) = png_of(&frames, kind, scale, 0, &durations, &gopts)?;
         Ok(([(header::CONTENT_TYPE, ct)], bytes).into_response())
     })
     .await

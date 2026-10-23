@@ -122,6 +122,15 @@ fn rest_auth_and_assets() {
     let (st, head, gif) = req(&s.addr, "GET", "/v1/sprites/apple.gif", &[AUTH], b"");
     assert_eq!((st, header(&head, "content-type")), (200, Some("image/gif")));
     assert_eq!(&gif[..6], b"GIF89a");
+    let plain_tag = header(&head, "etag").unwrap().to_string();
+    // GIF options change the bytes and the ETag; bad options are a 400, not a silent default
+    let (st, head, pp) = req(&s.addr, "GET", "/v1/sprites/apple.gif?loop=pingpong&bg=f6f5f0&repeat=2", &[AUTH], b"");
+    assert_eq!(st, 200);
+    assert_ne!(pp, gif);
+    assert_ne!(header(&head, "etag").unwrap(), plain_tag);
+    assert_eq!(req(&s.addr, "GET", "/v1/sprites/apple.gif?bg=plaid", &[AUTH], b"").0, 400);
+    assert_eq!(req(&s.addr, "GET", "/v1/sprites/apple.gif?loop=sideways", &[AUTH], b"").0, 400);
+    assert_eq!(req(&s.addr, "GET", "/v1/sprites/apple.gif?repeat=0", &[AUTH], b"").0, 400);
 
     let (st, _, sheet) = req(&s.addr, "GET", "/v1/sprites/apple.sheet.png", &[AUTH], b"");
     assert_eq!(st, 200);
@@ -158,7 +167,7 @@ async fn mcp_over_http_shares_the_library() {
     let cfg = StreamableHttpClientTransportConfig::with_uri(url).auth_header(TOKEN);
     let client = ().serve(StreamableHttpClientTransport::from_config(cfg)).await.expect("connect with token");
     let tools = client.list_all_tools().await.unwrap();
-    assert_eq!(tools.len(), 9);
+    assert_eq!(tools.len(), 10);
 
     let mut p = CallToolRequestParams::new("create_sprite");
     p.arguments = json!({"name": "moon", "category": "nature", "prims": [{"t":"arc","c":[16,16],"r":12,"a0":-90,"a1":90,"m":"yellow"}]})

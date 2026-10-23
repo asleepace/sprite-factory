@@ -74,7 +74,22 @@ Extra `tracks` animate groups (`g`) — this is where personality comes from:
 ]
 ```
 `prop`: dx | dy | rot | sx | sy. `amp`: amount (px, degrees, or scale delta). `wave`: sin (default) | abs | abs2 | saw | square.
-`phase`: 0–1 offset. `pivot`: center | bottom | top | [x,y] | each. 8 frames per loop.
+`phase`: 0–1 offset. `pivot`: center | bottom | top | [x,y] | each.
+
+**`px` pixels are rigid stamps.** They ride along with their group's motion by whole pixels and never
+stretch, squash or turn, so eyes and little patterns (hearts, sparkles) stay crisp in every frame. All
+`px` prims in one group move together (a heart and its glint stay locked). Scaling or rotating a
+px-only group therefore does nothing visible; animate px with `dx`/`dy`, or draw the part with shapes
+if it really should grow.
+
+Timing (optional, top level):
+- `frames`: frames per loop (default 8, max 64). `ms`: ms per frame (default 110).
+- `hold`: per-frame multiplier of `ms`, e.g. `[3,1,1,1,3,1,1,1]` to linger on the poses. Missing entries are 1.
+- `snap: true`: rounds every `dx`/`dy` to whole pixels, so motion is a clean pixel-art step instead of a
+  sub-pixel re-draw. Pair it with `"wave":"square"` or a small `amp` for a crisp bounce.
+
+`export_gif` turns a sprite into an animated GIF using the renderer's exact palette: transparent by
+default, timed from `ms`/`hold`, with optional `bg`, `pingpong` and `repeat`.
 
 ## Review loop (do this — it's the whole point)
 ```bash

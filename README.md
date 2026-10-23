@@ -61,8 +61,10 @@ claude mcp add --transport http sprite-factory https://sprites.example.com/mcp -
 ```
 
 Tools: `style_guide`, `list_sprites`, `get_sprite`, `create_sprite`, `edit_sprite`, `render_sprite`,
-`delete_sprite`, `blind_review`, `export_atlas`. Every create/edit returns the rendered sprite,
+`delete_sprite`, `blind_review`, `export_gif`, `export_atlas`. Every create/edit returns the rendered sprite,
 its animation frames and measured style warnings, so the model sees its work and revises.
+`export_gif` returns the animated GIF inline (exact palette, transparent by default) and, when
+`SPRITE_PUBLIC_URL` is set, a download URL for it.
 
 `blind_review` shows a fresh model an unlabeled, shuffled sheet and grades its guesses against
 each sprite's name and `aka` synonyms. It uses, in order:

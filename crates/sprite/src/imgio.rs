@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use sprite_core::{Frame, SIZE};
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::Path;
 
@@ -141,40 +142,153 @@ pub fn decode_png(path: &Path) -> Result<Rgba> {
     Ok(Rgba { w, h, px })
 }
 
-/// Looping animated GIF at `scale`, transparent background.
-pub fn gif(frames: &[Frame], scale: usize, ms: u32) -> Result<Vec<u8>> {
-    let side = (SIZE * scale) as u16;
-    let mut out = Vec::new();
-    {
-        let mut enc = gif::Encoder::new(&mut out, side, side, &[])?;
-        enc.set_repeat(gif::Repeat::Infinite)?;
-        for f in frames {
-            let mut img = Rgba::new(SIZE * scale, SIZE * scale);
-            img.blit_frame(f, 0, 0, scale);
-            let mut fr = gif::Frame::from_rgba_speed(side, side, &mut img.px, 10);
-            fr.delay = (ms / 10) as u16;
-            fr.dispose = gif::DisposalMethod::Background;
-            enc.write_frame(&fr)?;
-        }
-    }
-    Ok(out)
+/// How a GIF is put together. The default is what most callers want: transparent, loops forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GifOpts {
+    /// nearest-neighbour upscale factor
+    pub scale: usize,
+    /// flat background colour; `None` keeps the background transparent
+    pub bg: Option<[u8; 3]>,
+    /// play forward then backward (0 1 2 3 2 1 …) instead of wrapping around
+    pub pingpong: bool,
+    /// times to play; `None` loops forever
+    pub repeat: Option<u16>,
 }
 
-/// Looping animated GIF from square RGBA buffers of any size (HD frames), transparent background.
-pub fn gif_raw(frames: &[&[u8]], side: usize, ms: u32) -> Result<Vec<u8>> {
+impl Default for GifOpts {
+    fn default() -> Self {
+        GifOpts { scale: 4, bg: None, pingpong: false, repeat: None }
+    }
+}
+
+/// What `encode_gif` produced, for callers that report on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GifInfo {
+    pub side: usize,
+    /// frames actually written, after identical neighbours were merged
+    pub frames: usize,
+    /// one pass through the loop, in ms
+    pub loop_ms: u32,
+}
+
+/// Animated GIF from 32×32 sprite frames. `durations` is ms per frame (see `Spec::frame_ms`).
+pub fn gif(frames: &[Frame], durations: &[u32], o: &GifOpts) -> Result<(Vec<u8>, GifInfo)> {
+    let bufs: Vec<&[u8]> = frames.iter().map(|f| f.0.as_slice()).collect();
+    encode_gif(&bufs, SIZE, durations, o)
+}
+
+/// Animated GIF from square RGBA buffers of side `side` (32px frames or HD frames).
+///
+/// Sprites only ever use the renderer's fixed colours, so the GIF gets one global palette built
+/// from them: no quantization, no dithering, identical colours in every frame. Index 0 is the
+/// transparent (or background) colour. Identical consecutive frames are merged into one longer
+/// frame, and delays are rounded on the running total so a loop keeps its exact length.
+pub fn encode_gif(frames: &[&[u8]], side: usize, durations: &[u32], o: &GifOpts) -> Result<(Vec<u8>, GifInfo)> {
+    anyhow::ensure!(!frames.is_empty(), "no frames to encode");
+    let scale = o.scale.max(1);
+    let out_side = side * scale;
+    anyhow::ensure!(out_side <= 4096, "GIF would be {out_side}px wide; keep side × scale ≤ 4096");
+
+    // ── palette: [bg/transparent] + every colour the renderer can emit, padded to 256
+    let colours = sprite_core::Palette::new().output_colors();
+    let mut table: Vec<[u8; 3]> = Vec::with_capacity(256);
+    table.push(o.bg.unwrap_or([0, 0, 0]));
+    table.extend(&colours);
+    let mut lookup: HashMap<[u8; 3], u8> = colours.iter().enumerate().map(|(i, c)| (*c, (i + 1) as u8)).collect();
+    let flat: Vec<u8> = table.iter().flatten().copied().chain(std::iter::repeat(0)).take(768).collect();
+
+    // ── play order
+    let n = frames.len();
+    let mut order: Vec<usize> = (0..n).collect();
+    if o.pingpong && n > 2 {
+        order.extend((1..n - 1).rev());
+    }
+
+    // ── index each frame (upscaled), merging identical neighbours
+    let mut out_frames: Vec<(Vec<u8>, u32)> = Vec::new();
+    for &i in &order {
+        let src = frames[i];
+        anyhow::ensure!(src.len() == side * side * 4, "frame {i} is not {side}×{side} RGBA");
+        let mut idx = vec![0u8; out_side * out_side];
+        for y in 0..side {
+            for x in 0..side {
+                let p = &src[(y * side + x) * 4..(y * side + x) * 4 + 4];
+                let v = if p[3] == 0 {
+                    0
+                } else {
+                    let c = [p[0], p[1], p[2]];
+                    match lookup.get(&c) {
+                        Some(&v) => v,
+                        None => {
+                            // not a renderer colour (shouldn't happen); use the nearest one
+                            let v = nearest(&colours, c) as u8 + 1;
+                            lookup.insert(c, v);
+                            v
+                        }
+                    }
+                };
+                for yy in 0..scale {
+                    let row = (y * scale + yy) * out_side + x * scale;
+                    idx[row..row + scale].fill(v);
+                }
+            }
+        }
+        let ms = durations.get(i).copied().unwrap_or(110);
+        match out_frames.last_mut() {
+            Some((prev, d)) if *prev == idx => *d += ms,
+            _ => out_frames.push((idx, ms)),
+        }
+    }
+
+    // ── write
     let mut out = Vec::new();
+    let mut total_ms = 0u32;
     {
-        let mut enc = gif::Encoder::new(&mut out, side as u16, side as u16, &[])?;
-        enc.set_repeat(gif::Repeat::Infinite)?;
-        for f in frames {
-            let mut px = f.to_vec();
-            let mut fr = gif::Frame::from_rgba_speed(side as u16, side as u16, &mut px, 10);
-            fr.delay = (ms / 10) as u16;
-            fr.dispose = gif::DisposalMethod::Background;
+        let s16 = out_side as u16;
+        let mut enc = gif::Encoder::new(&mut out, s16, s16, &flat)?;
+        // The loop extension counts *re*plays and 0 means forever, so "play once" omits it entirely.
+        match o.repeat {
+            None => enc.set_repeat(gif::Repeat::Infinite)?,
+            Some(k) if k > 1 => enc.set_repeat(gif::Repeat::Finite(k - 1))?,
+            Some(_) => {}
+        }
+        let mut t_cs = 0u32; // running total, in GIF centiseconds
+        for (idx, ms) in &out_frames {
+            total_ms += ms;
+            let end_cs = (total_ms + 5) / 10;
+            let delay = end_cs.saturating_sub(t_cs).max(2); // browsers turn delays < 2cs into 10cs
+            t_cs += delay;
+            let fr = gif::Frame {
+                width: s16,
+                height: s16,
+                delay: delay.min(u16::MAX as u32) as u16,
+                dispose: gif::DisposalMethod::Background,
+                transparent: if o.bg.is_none() { Some(0) } else { None },
+                buffer: std::borrow::Cow::Borrowed(idx),
+                ..gif::Frame::default()
+            };
             enc.write_frame(&fr)?;
         }
     }
-    Ok(out)
+    Ok((out, GifInfo { side: out_side, frames: out_frames.len(), loop_ms: total_ms }))
+}
+
+fn nearest(colours: &[[u8; 3]], c: [u8; 3]) -> usize {
+    let d = |a: &[u8; 3]| (0..3).map(|k| (a[k] as i32 - c[k] as i32).pow(2)).sum::<i32>();
+    (0..colours.len()).min_by_key(|&i| d(&colours[i])).unwrap_or(0)
+}
+
+/// Parse a background argument: "transparent"/"none"/"" → None, "#rrggbb" or "rrggbb" → colour.
+pub fn parse_bg(s: &str) -> std::result::Result<Option<[u8; 3]>, String> {
+    let t = s.trim().trim_start_matches('#');
+    if t.is_empty() || t.eq_ignore_ascii_case("transparent") || t.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    if t.len() != 6 || !t.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("bg must be \"transparent\" or a hex colour like #f6f5f0, not {s:?}"));
+    }
+    let p = |i: usize| u8::from_str_radix(&t[i..i + 2], 16).unwrap();
+    Ok(Some([p(0), p(2), p(4)]))
 }
 
 /// Grid of first frames with a label under each — the image a model critiques.
@@ -222,4 +336,114 @@ pub fn write(path: &Path, bytes: &[u8]) -> Result<()> {
         }
     }
     std::fs::write(path, bytes).with_context(|| format!("write {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sprite_core::{render_anim, Palette, RenderOpts, Spec};
+
+    struct Decoded {
+        delays: Vec<u16>,
+        transparent: Vec<Option<u8>>,
+        palette_len: usize,
+        repeat: gif::Repeat,
+        first: Vec<u8>,
+        side: u16,
+    }
+
+    fn decode(bytes: &[u8]) -> Decoded {
+        let mut opts = gif::DecodeOptions::new();
+        opts.set_color_output(gif::ColorOutput::Indexed);
+        let mut d = opts.read_info(bytes).unwrap();
+        let (mut delays, mut transparent, mut first) = (vec![], vec![], None);
+        while let Some(f) = d.read_next_frame().unwrap() {
+            delays.push(f.delay);
+            transparent.push(f.transparent);
+            first.get_or_insert_with(|| f.buffer.to_vec());
+            assert!(f.palette.is_none(), "frames share the global palette");
+        }
+        Decoded {
+            delays,
+            transparent,
+            palette_len: d.global_palette().map_or(0, |p| p.len() / 3),
+            repeat: d.repeat(),
+            first: first.unwrap(),
+            side: d.width(),
+        }
+    }
+
+    fn sprite(v: serde_json::Value) -> (Spec, Vec<Frame>) {
+        let pal = Palette::new();
+        let s = Spec::from_json(&v, &pal).unwrap();
+        let f = render_anim(&s, &pal, &RenderOpts::default());
+        (s, f)
+    }
+
+    fn durations(s: &Spec, n: usize) -> Vec<u32> {
+        (0..n).map(|i| s.frame_ms(i)).collect()
+    }
+
+    #[test]
+    fn transparent_by_default_with_one_global_palette() {
+        let (s, f) = sprite(serde_json::json!({"name": "b", "anim": "bob", "prims": [{"t": "ellipse", "c": [16, 16], "r": 10, "m": "red"}]}));
+        let (bytes, info) = gif(&f, &durations(&s, f.len()), &GifOpts::default()).unwrap();
+        let d = decode(&bytes);
+        assert_eq!((d.side, info.side), (128, 128), "default scale 4");
+        assert_eq!(d.palette_len, 256);
+        assert!(d.transparent.iter().all(|t| *t == Some(0)));
+        assert_eq!(d.first[0], 0, "corner is the transparent index");
+        assert_eq!(d.repeat, gif::Repeat::Infinite);
+    }
+
+    #[test]
+    fn background_colour_replaces_transparency() {
+        let (s, f) = sprite(serde_json::json!({"name": "b", "prims": [{"t": "ellipse", "c": [16, 16], "r": 10, "m": "red"}]}));
+        let o = GifOpts { scale: 2, bg: Some([246, 245, 240]), ..Default::default() };
+        let d = decode(&gif(&f, &durations(&s, f.len()), &o).unwrap().0);
+        assert!(d.transparent.iter().all(|t| t.is_none()));
+        assert_eq!(d.side, 64);
+    }
+
+    #[test]
+    fn timing_follows_hold_and_identical_frames_merge() {
+        // square-wave bob with snap: frames 0–3 are identical, as are 4–7
+        let (s, f) = sprite(serde_json::json!({"name": "b", "snap": true, "ms": 100, "hold": [2], "prims": [{"t": "ellipse", "c": [16, 16], "r": 10, "m": "red"}],
+            "tracks": [{"prop": "dy", "amp": 1, "wave": "square"}]}));
+        assert_eq!(f.len(), 8);
+        let (bytes, info) = gif(&f, &durations(&s, f.len()), &GifOpts::default()).unwrap();
+        let d = decode(&bytes);
+        assert_eq!(info.frames, 2, "identical neighbours merged");
+        assert_eq!(d.delays, vec![50, 40], "200+100+100+100 ms, then 4×100 ms, in centiseconds");
+        assert_eq!(info.loop_ms, 900);
+    }
+
+    #[test]
+    fn delays_round_on_the_running_total() {
+        // 8 × 115 ms = 920 ms; per-frame rounding would give 8 × 12 = 960 or 8 × 11 = 880
+        let (s, f) = sprite(serde_json::json!({"name": "b", "anim": "spin", "ms": 115, "prims": [{"t": "star", "c": [16, 16], "r": 12, "m": "gold"}]}));
+        let d = decode(&gif(&f, &durations(&s, f.len()), &GifOpts::default()).unwrap().0);
+        assert_eq!(d.delays.iter().map(|&x| x as u32).sum::<u32>(), 92);
+    }
+
+    #[test]
+    fn pingpong_and_repeat() {
+        let (s, f) = sprite(serde_json::json!({"name": "b", "anim": "spin", "prims": [{"t": "star", "c": [16, 16], "r": 12, "m": "gold"}]}));
+        let dur = durations(&s, f.len());
+        let pp = decode(&gif(&f, &dur, &GifOpts { pingpong: true, ..Default::default() }).unwrap().0);
+        assert_eq!(pp.delays.len(), 14, "0..7 then 6..1");
+        let three = decode(&gif(&f, &dur, &GifOpts { repeat: Some(3), ..Default::default() }).unwrap().0);
+        assert_eq!(three.repeat, gif::Repeat::Finite(2), "3 plays = 2 replays");
+        let once = decode(&gif(&f, &dur, &GifOpts { repeat: Some(1), ..Default::default() }).unwrap().0);
+        assert_ne!(once.repeat, gif::Repeat::Infinite, "play-once must not loop");
+    }
+
+    #[test]
+    fn parse_bg_accepts_hex_and_transparent() {
+        assert_eq!(parse_bg("transparent").unwrap(), None);
+        assert_eq!(parse_bg("").unwrap(), None);
+        assert_eq!(parse_bg("#F6f5f0").unwrap(), Some([246, 245, 240]));
+        assert_eq!(parse_bg("102030").unwrap(), Some([16, 32, 48]));
+        assert!(parse_bg("red").is_err() && parse_bg("#fff").is_err());
+    }
 }
