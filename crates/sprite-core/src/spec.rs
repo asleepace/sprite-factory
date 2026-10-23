@@ -202,7 +202,14 @@ impl Spec {
                 }
             }
         }
-        let frames = num(o, "frames").map(|f| f.clamp(1.0, crate::MAX_FRAMES as f64) as usize).unwrap_or(crate::FRAMES);
+        let frames = match num(o, "frames") {
+            None => crate::FRAMES,
+            Some(f) if f > crate::MAX_FRAMES as f64 => {
+                errs.push(format!("frames must be at most {} (got {f})", crate::MAX_FRAMES));
+                crate::MAX_FRAMES
+            }
+            Some(f) => f.max(1.0) as usize,
+        };
         let mut hold = Vec::new();
         match o.get("hold") {
             None | Some(Value::Null) => {}
@@ -227,7 +234,7 @@ impl Spec {
             cat: o.get("cat").and_then(Value::as_str).map(str::to_string),
             anim,
             frames,
-            ms: num(o, "ms").map(|f| f.clamp(20.0, 10_000.0) as u32).unwrap_or(110),
+            ms: num(o, "ms").map(|f| f.max(16.0) as u32).unwrap_or(110),
             hold,
             snap: truthy(o.get("snap")),
             tracks,
@@ -240,9 +247,11 @@ impl Spec {
         self.anim != "none" || !self.tracks.is_empty()
     }
 
-    /// How long frame `i` is shown, in ms (`ms` × its hold).
+    /// How long frame `i` is shown, in ms (`ms` × its hold). A still sprite renders one frame, so
+    /// `hold` doesn't apply to it.
     pub fn frame_ms(&self, i: usize) -> u32 {
-        self.ms * self.hold.get(i).copied().unwrap_or(1)
+        let hold = if self.is_animated() { self.hold.get(i).copied().unwrap_or(1) } else { 1 };
+        self.ms.saturating_mul(hold)
     }
 }
 

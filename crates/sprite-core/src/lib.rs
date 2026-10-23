@@ -22,6 +22,8 @@ pub const SS: usize = 8;
 pub const FRAMES: usize = 8;
 /// Upper bound on `frames`, so one spec can't ask for an unbounded render.
 pub const MAX_FRAMES: usize = 64;
+/// Bumped whenever the same spec renders differently, so HTTP ETags change with the output.
+pub const RENDER_VERSION: u64 = 2;
 
 /// Parse + render in one call. Errors are human-readable spec problems.
 pub fn render_json(spec: &serde_json::Value) -> Result<(Spec, Vec<Frame>), Vec<String>> {

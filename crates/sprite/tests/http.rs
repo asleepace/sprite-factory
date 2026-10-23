@@ -123,7 +123,7 @@ fn rest_auth_and_assets() {
     assert_eq!((st, header(&head, "content-type")), (200, Some("image/gif")));
     assert_eq!(&gif[..6], b"GIF89a");
     let plain_tag = header(&head, "etag").unwrap().to_string();
-    // GIF options change the bytes and the ETag; bad options are a 400, not a silent default
+    // GIF options change the bytes and the ETag; bad GIF options are a 400, not a silent default
     let (st, head, pp) = req(&s.addr, "GET", "/v1/sprites/apple.gif?loop=pingpong&bg=f6f5f0&repeat=2", &[AUTH], b"");
     assert_eq!(st, 200);
     assert_ne!(pp, gif);
@@ -131,6 +131,11 @@ fn rest_auth_and_assets() {
     assert_eq!(req(&s.addr, "GET", "/v1/sprites/apple.gif?bg=plaid", &[AUTH], b"").0, 400);
     assert_eq!(req(&s.addr, "GET", "/v1/sprites/apple.gif?loop=sideways", &[AUTH], b"").0, 400);
     assert_eq!(req(&s.addr, "GET", "/v1/sprites/apple.gif?repeat=0", &[AUTH], b"").0, 400);
+    // GIF options belong to .gif only; other formats ignore them, and ?frame doesn't fork a GIF's ETag
+    assert_eq!(req(&s.addr, "GET", "/v1/sprites/apple.png?bg=plaid", &[AUTH], b"").0, 200);
+    assert_eq!(req(&s.addr, "GET", "/v1/sprites/apple.sheet.png?loop=x", &[AUTH], b"").0, 200);
+    let (_, head, _) = req(&s.addr, "GET", "/v1/sprites/apple.gif?frame=3", &[AUTH], b"");
+    assert_eq!(header(&head, "etag").unwrap(), plain_tag);
 
     let (st, _, sheet) = req(&s.addr, "GET", "/v1/sprites/apple.sheet.png", &[AUTH], b"");
     assert_eq!(st, 200);

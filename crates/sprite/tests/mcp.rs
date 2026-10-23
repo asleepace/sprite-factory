@@ -118,7 +118,14 @@ async fn tools_and_editing() {
     assert!(lib.join("_export/jar.gif").exists());
     let bad_bg = call(&c, "export_gif", json!({"name": "jar", "bg": "plaid"})).await;
     assert_eq!(bad_bg.is_error, Some(true));
+    let big = call(&c, "export_gif", json!({"name": "jar", "scale": 99})).await;
+    assert!(text_of(&big).contains("scale must be"), "{}", text_of(&big));
+    // null puts a timing field back to its default
+    call(&c, "edit_sprite", json!({"name": "jar", "hold": null})).await;
+    let got: Value = serde_json::from_str(&text_of(&call(&c, "get_sprite", json!({"name": "jar"})).await)).unwrap();
+    assert!(got.get("hold").is_none());
     assert!(!text_of(&g).contains("URL"), "no download link without SPRITE_PUBLIC_URL");
+    assert!(!text_of(&g).contains(lib.to_str().unwrap()), "server paths stay private");
 
     let atlas = call(&c, "export_atlas", json!({"file": "home", "scale": 2})).await;
     assert!(text_of(&atlas).contains("Exported 2 sprites"), "{}", text_of(&atlas));

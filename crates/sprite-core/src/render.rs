@@ -64,7 +64,7 @@ pub struct HdFrame {
 
 /// Supported HD sizes: multiples of 32 from 64 to 1024.
 pub fn hd_size_ok(size: usize) -> bool {
-    (64..=1024).contains(&size) && size % 32 == 0
+    (64..=1024).contains(&size) && size.is_multiple_of(32)
 }
 
 /// Draw the spec at `size`×`size` (a multiple of 32). Curves come from the vector shapes, so the
@@ -324,30 +324,29 @@ fn render_sized(spec: &Spec, t: f64, pal: &Palette, opts: &RenderOpts, size: usi
     }
 
     // ── pixel overrides (eyes, glints): one pixel at 32px; a round dot of the same footprint in HD.
-    // px prims are stamps: each moves as one rigid block by a whole-pixel offset, so a pattern
-    // (an eye, a heart) never tears under scale or rotation. The offset is where the frame's
-    // transform carries the anchor (the centroid of every px prim in the same group), so a heart
-    // and its glint share it and stay locked together.
+    // px pixels are drawn as rigid stamps (see `px_offsets`), so a pattern never tears.
     let px_label = prims.len() as i32 + 1;
-    let deltas = px_offsets(prims, &pm);
+    let offsets = px_offsets(prims, &pm, k);
+    let (ki, kf) = (k as i64, k as f64);
+    let pad: i64 = if k > 1 { 1 } else { 0 };
     for (i, p) in prims.iter().enumerate() {
         if p.kind != Kind::Px {
             continue;
         }
         let col = pal.ramp(p.m)[p.shade as usize];
-        let [ddx, ddy] = deltas[i];
-        for qp in &p.pts {
-            let (xi, yi) = ((qp[0] + ddx).floor(), (qp[1] + ddy).floor());
-            if !(xi >= 0.0 && yi >= 0.0 && xi < 32.0 && yi < 32.0) {
+        for (qp, d) in p.pts.iter().zip(&offsets[i]) {
+            // output-pixel top-left of this sprite pixel; offsets are whole output pixels
+            let x0 = ((qp[0].floor() + d[0]) * kf).round() as i64;
+            let y0 = ((qp[1].floor() + d[1]) * kf).round() as i64;
+            if x0 + ki <= 0 || y0 + ki <= 0 || x0 >= size as i64 || y0 >= size as i64 {
                 continue;
             }
-            let (cx, cy) = ((xi + 0.5) * k as f64, (yi + 0.5) * k as f64);
-            let rad = k as f64 * 0.62;
-            let (x0, x1) = ((xi as usize) * k, (xi as usize + 1) * k);
-            let (y0, y1) = ((yi as usize) * k, (yi as usize + 1) * k);
-            let pad = if k > 1 { 1 } else { 0 };
-            for y in y0.saturating_sub(pad)..(y1 + pad).min(size) {
-                for x in x0.saturating_sub(pad)..(x1 + pad).min(size) {
+            let (cx, cy) = (x0 as f64 + kf / 2.0, y0 as f64 + kf / 2.0);
+            let rad = kf * 0.62;
+            let xs = (x0 - pad).max(0) as usize..(x0 + ki + pad).min(size as i64) as usize;
+            let ys = (y0 - pad).max(0) as usize..(y0 + ki + pad).min(size as i64) as usize;
+            for y in ys {
+                for x in xs.clone() {
                     if k > 1 {
                         let (dx, dy) = (x as f64 + 0.5 - cx, y as f64 + 0.5 - cy);
                         if dx * dx + dy * dy > rad * rad {
@@ -396,43 +395,60 @@ fn render_sized(spec: &Spec, t: f64, pal: &Palette, opts: &RenderOpts, size: usi
     rgba
 }
 
-/// Whole-pixel offset for each px prim this frame (zero for other prims). Prims in the same
-/// group share an anchor; ungrouped px prims share one too. A prim with its own transform
-/// (pivot "each") still uses its own matrix, applied to the shared anchor.
-fn px_offsets(prims: &[Prim], pm: &[Mat]) -> Vec<[f64; 2]> {
-    let mut sums: Vec<(Option<&str>, [f64; 2], usize)> = Vec::new();
-    for p in prims.iter().filter(|p| p.kind == Kind::Px) {
-        let key = p.g.as_deref();
-        let slot = match sums.iter().position(|s| s.0 == key) {
-            Some(k) => k,
-            None => {
-                sums.push((key, [0.0; 2], 0));
-                sums.len() - 1
-            }
-        };
-        for q in &p.pts {
-            // pixel centres, so a 1-px stamp's anchor is the middle of that pixel
-            sums[slot].1[0] += q[0].floor() + 0.5;
-            sums[slot].1[1] += q[1].floor() + 0.5;
-            sums[slot].2 += 1;
+/// This frame's offset for every px point, in sprite px, rounded to whole output pixels
+/// (`1/k` sprite px; whole sprite pixels at 32px). Indexed `[prim][point]`; empty for non-px prims.
+///
+/// px pixels move as rigid **stamps** so a pattern (an eye, a heart) never tears under scale or
+/// rotation. A stamp is a cluster of 8-connected px pixels that share a group and this frame's
+/// transform: a heart and the glint drawn on it are one stamp, while two eyes are two stamps that
+/// each follow their own spot on a turning, squashing head. Each stamp moves by where the
+/// transform carries its anchor (the mean of its points, the same convention pivots use).
+fn px_offsets(prims: &[Prim], pm: &[Mat], k: usize) -> Vec<Vec<[f64; 2]>> {
+    // every px point: (prim, point index, cell)
+    let mut pts: Vec<(usize, usize, [i64; 2])> = Vec::new();
+    for (i, p) in prims.iter().enumerate().filter(|(_, p)| p.kind == Kind::Px) {
+        for (j, q) in p.pts.iter().enumerate() {
+            pts.push((i, j, [q[0].floor() as i64, q[1].floor() as i64]));
         }
     }
-    prims
-        .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            if p.kind != Kind::Px {
-                return [0.0; 2];
+    // union-find over points that touch and share group + transform
+    let mut parent: Vec<usize> = (0..pts.len()).collect();
+    fn find(parent: &mut [usize], mut a: usize) -> usize {
+        while parent[a] != a {
+            parent[a] = parent[parent[a]];
+            a = parent[a];
+        }
+        a
+    }
+    let same = |a: usize, b: usize| prims[a].g == prims[b].g && pm[a] == pm[b];
+    for a in 0..pts.len() {
+        for b in a + 1..pts.len() {
+            let (ca, cb) = (pts[a].2, pts[b].2);
+            if (ca[0] - cb[0]).abs() <= 1 && (ca[1] - cb[1]).abs() <= 1 && same(pts[a].0, pts[b].0) {
+                let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+                parent[ra] = rb;
             }
-            let Some((_, s, n)) = sums.iter().find(|s| s.0 == p.g.as_deref()) else { return [0.0; 2] };
-            if *n == 0 {
-                return [0.0; 2];
-            }
-            let anchor = [s[0] / *n as f64, s[1] / *n as f64];
-            let a = apply(&pm[i], anchor);
-            [(a[0] - anchor[0]).round(), (a[1] - anchor[1]).round()]
-        })
-        .collect()
+        }
+    }
+    // anchor per stamp → offset
+    let mut sum: Vec<([f64; 2], usize)> = vec![([0.0; 2], 0); pts.len()];
+    for a in 0..pts.len() {
+        let r = find(&mut parent, a);
+        let q = prims[pts[a].0].pts[pts[a].1];
+        sum[r].0[0] += q[0];
+        sum[r].0[1] += q[1];
+        sum[r].1 += 1;
+    }
+    let kf = k as f64;
+    let mut out: Vec<Vec<[f64; 2]>> = prims.iter().map(|p| if p.kind == Kind::Px { vec![[0.0; 2]; p.pts.len()] } else { vec![] }).collect();
+    for a in 0..pts.len() {
+        let r = find(&mut parent, a);
+        let (s, n) = sum[r];
+        let anchor = [s[0] / n as f64, s[1] / n as f64];
+        let to = apply(&pm[pts[a].0], anchor);
+        out[pts[a].0][pts[a].1] = [((to[0] - anchor[0]) * kf).round() / kf, ((to[1] - anchor[1]) * kf).round() / kf];
+    }
+    out
 }
 
 /// Offsets within radius `r`, nearest first. r = 1 is the classic 4-neighbourhood (down, right,

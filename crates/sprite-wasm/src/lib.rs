@@ -7,6 +7,7 @@
 //! await init();
 //! const out = render(JSON.stringify(spec));      // throws a readable error for bad specs
 //! const frames = out.frames;                    // Uint8Array, out.frameCount × 32×32×4 RGBA
+//! const durations = out.durations;              // Uint32Array, ms per frame (ms × hold)
 //! const lint = JSON.parse(out.lint);            // { warnings, bbox, span_px, colors, frames, prims }
 //! ```
 use sprite_core::{lint::lint, render_anim, Palette, RenderOpts, Spec, SIZE};
@@ -18,6 +19,7 @@ pub struct Rendered {
     frames: Vec<u8>,
     frame_count: usize,
     ms: u32,
+    durations: Vec<u32>,
     lint: String,
 }
 
@@ -37,6 +39,11 @@ impl Rendered {
     pub fn ms(&self) -> u32 {
         self.ms
     }
+    /// Milliseconds each frame is shown (`ms` × its `hold`), one per frame.
+    #[wasm_bindgen(getter)]
+    pub fn durations(&self) -> Vec<u32> {
+        self.durations.clone()
+    }
     /// Style warnings and stats as JSON.
     #[wasm_bindgen(getter)]
     pub fn lint(&self) -> String {
@@ -49,10 +56,12 @@ impl Rendered {
 pub fn render(spec_json: &str) -> Result<Rendered, JsError> {
     let (spec, frames) = render_inner(spec_json).map_err(|e| JsError::new(&e))?;
     let l = lint(&spec, &frames);
+    let durations = (0..frames.len()).map(|i| spec.frame_ms(i)).collect();
     Ok(Rendered {
         frame_count: frames.len(),
         frames: frames.into_iter().flat_map(|f| f.0).collect(),
         ms: spec.ms,
+        durations,
         lint: serde_json::to_string(&l).unwrap_or_default(),
     })
 }

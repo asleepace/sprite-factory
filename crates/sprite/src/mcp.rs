@@ -120,8 +120,8 @@ fn anim_schema() -> Value {
 /// Timing fields shared by create_sprite and edit_sprite.
 fn timing_props() -> [(&'static str, Value); 4] {
     [
-        ("frames", json!({"type": "integer", "minimum": 2, "maximum": sprite_core::MAX_FRAMES, "description": "frames per loop (default 8)"})),
-        ("ms", json!({"type": "integer", "minimum": 20, "maximum": 10000, "description": "ms per frame (default 110)"})),
+        ("frames", json!({"type": "integer", "minimum": 1, "maximum": sprite_core::MAX_FRAMES, "description": "frames per loop (default 8)"})),
+        ("ms", json!({"type": "integer", "minimum": 16, "description": "ms per frame (default 110)"})),
         ("hold", json!({"type": "array", "items": {"type": "integer", "minimum": 1, "maximum": 100},
             "description": "per-frame hold in units of ms, e.g. [3,1,1,1,3,1,1,1] lingers on the poses; missing entries are 1"})),
         ("snap", json!({"type": "boolean", "description": "round dx/dy motion to whole pixels for crisp, stepped movement"})),
@@ -129,6 +129,8 @@ fn timing_props() -> [(&'static str, Value); 4] {
 }
 
 const TIMING_KEYS: [&str; 4] = ["frames", "ms", "hold", "snap"];
+/// export_gif returns the GIF inline only up to this size, so a big one can't flood the context.
+const MAX_INLINE_GIF: usize = 1 << 20;
 
 fn obj(props: Value, required: &[&str]) -> Arc<Map<String, Value>> {
     let v = json!({"type": "object", "properties": props, "required": required});
@@ -340,7 +342,7 @@ impl SpriteServer {
         }
         spec.insert("anim".into(), a.get("anim").cloned().unwrap_or(json!("none")));
         for k in TIMING_KEYS {
-            if let Some(x) = a.get(k) {
+            if let Some(x) = a.get(k).filter(|x| !x.is_null()) {
                 spec.insert(k.into(), x.clone());
             }
         }
@@ -356,9 +358,14 @@ impl SpriteServer {
         let name = arg_str(a, "name").unwrap_or_default();
         let mut v = self.load(name)?;
         let o = v.as_object_mut().ok_or("stored spec is not an object")?;
-        for k in ["anim", "tracks", "aka", "prims"].into_iter().chain(TIMING_KEYS) {
+        for k in ["anim", "tracks", "aka", "prims"] {
+            if let Some(x) = a.get(k) {
+                o.insert(k.into(), x.clone());
+            }
+        }
+        for k in TIMING_KEYS {
             match a.get(k) {
-                // null clears a timing field back to its default
+                // null puts a timing field back to its default
                 Some(Value::Null) => {
                     o.remove(k);
                 }
@@ -408,13 +415,16 @@ impl SpriteServer {
         let name = arg_str(a, "name").unwrap_or_default();
         let v = self.load(name)?;
         let (spec, frames) = render_spec(&v).map_err(|e| format!("\"{name}\" has an invalid spec:\n- {}", e.join("\n- ")))?;
-        let scale = a.get("scale").and_then(Value::as_u64).unwrap_or(8).clamp(1, 16) as usize;
+        let scale = match a.get("scale") {
+            None | Some(Value::Null) => 8,
+            Some(v) => v.as_u64().filter(|s| (1..=16).contains(s)).ok_or("scale must be a whole number from 1 to 16")? as usize,
+        };
         let bg_arg = arg_str(a, "bg").unwrap_or("transparent");
         let bg = imgio::parse_bg(bg_arg)?;
         let pingpong = a.get("pingpong").and_then(Value::as_bool).unwrap_or(false);
         let repeat = match a.get("repeat") {
             None | Some(Value::Null) => None,
-            Some(r) => Some(r.as_u64().filter(|&n| (1..=u16::MAX as u64).contains(&n)).ok_or("repeat must be a whole number ≥ 1")? as u16),
+            Some(r) => Some(r.as_u64().filter(|&n| (1..=u16::MAX as u64).contains(&n)).ok_or("repeat must be a whole number from 1 to 65535")? as u16),
         };
         let opts = imgio::GifOpts { scale, bg, pingpong, repeat };
         let durations: Vec<u32> = (0..frames.len()).map(|i| spec.frame_ms(i)).collect();
@@ -437,7 +447,7 @@ impl SpriteServer {
             rep = repeat.map(|r| format!(", plays {r}×")).unwrap_or_default(),
             kb = gif.len() as f64 / 1024.0,
         )];
-        if frames.len() == 1 {
+        if !spec.is_animated() {
             lines.push("This sprite isn't animated, so the GIF is a single still frame. Give it an anim or tracks to animate it.".into());
         }
         if let Some(base) = &self.public_url {
@@ -457,11 +467,19 @@ impl SpriteServer {
                 q.join("&")
             ));
         }
-        lines.push(format!("Saved on the server at {}", path.display()));
-        Ok(CallToolResult::success(vec![
-            text(lines.join("\n")),
-            ContentBlock::image(base64::engine::general_purpose::STANDARD.encode(&gif), "image/gif"),
-        ]))
+        lines.push(format!("Saved to _export/{name}.gif in the sprite library."));
+        let mut content = vec![];
+        if gif.len() <= MAX_INLINE_GIF {
+            content.push(ContentBlock::image(base64::engine::general_purpose::STANDARD.encode(&gif), "image/gif"));
+        } else {
+            lines.push(format!(
+                "At {:.0} KB it's too big to return inline (limit {} KB); use the URL, or a smaller scale or fewer frames.",
+                gif.len() as f64 / 1024.0,
+                MAX_INLINE_GIF / 1024
+            ));
+        }
+        content.insert(0, text(lines.join("\n")));
+        Ok(CallToolResult::success(content))
     }
 
     fn export_atlas(&self, a: &Map<String, Value>) -> ToolOut {

@@ -60,14 +60,13 @@ pub fn lint(spec: &Spec, frames: &[Frame]) -> Lint {
         if !matches!(t.prop, Prop::Rot | Prop::Sx | Prop::Sy) {
             continue;
         }
-        let members: Vec<_> = spec.prims.iter().filter(|p| p.g.as_deref() == Some(g)).collect();
-        if members.iter().any(|p| p.kind == Kind::Px) {
-            let only_px = members.iter().all(|p| p.kind == Kind::Px);
+        if spec.prims.iter().any(|p| p.kind == Kind::Px && p.g.as_deref() == Some(g)) {
             warnings.push(format!(
-                "tracks[{k}] {}s group {g:?}, but px pixels are rigid stamps: they only follow where the group moves, never \
-                 stretch or turn.{} Animate px with dx/dy, or draw the part with shapes if it should scale.",
-                if t.prop == Prop::Rot { "rotate" } else { "scale" },
-                if only_px { " On a px-only group this usually does nothing." } else { "" }
+                "tracks[{k}] {} group {g:?}, which has px pixels. px are rigid stamps: they travel with the group but \
+                 never {} themselves. Draw that part with shapes if it should {}.",
+                if t.prop == Prop::Rot { "rotates" } else { "scales" },
+                if t.prop == Prop::Rot { "turn" } else { "grow or shrink" },
+                if t.prop == Prop::Rot { "turn" } else { "change size" },
             ));
         }
     }

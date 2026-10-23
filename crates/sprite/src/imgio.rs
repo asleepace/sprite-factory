@@ -165,10 +165,10 @@ impl Default for GifOpts {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GifInfo {
     pub side: usize,
-    /// frames actually written, after identical neighbours were merged
+    /// GIF frames written: identical neighbours merged, frames over 655.35 s split
     pub frames: usize,
     /// one pass through the loop, in ms
-    pub loop_ms: u32,
+    pub loop_ms: u64,
 }
 
 /// Animated GIF from 32×32 sprite frames. `durations` is ms per frame (see `Spec::frame_ms`).
@@ -182,20 +182,22 @@ pub fn gif(frames: &[Frame], durations: &[u32], o: &GifOpts) -> Result<(Vec<u8>,
 /// Sprites only ever use the renderer's fixed colours, so the GIF gets one global palette built
 /// from them: no quantization, no dithering, identical colours in every frame. Index 0 is the
 /// transparent (or background) colour. Identical consecutive frames are merged into one longer
-/// frame, and delays are rounded on the running total so a loop keeps its exact length.
+/// frame, and delays are rounded on the running total so a loop keeps its exact length. Frames
+/// stream straight into the encoder with a one-frame lookahead, so memory stays at two indexed
+/// frames however long the loop is.
 pub fn encode_gif(frames: &[&[u8]], side: usize, durations: &[u32], o: &GifOpts) -> Result<(Vec<u8>, GifInfo)> {
     anyhow::ensure!(!frames.is_empty(), "no frames to encode");
     let scale = o.scale.max(1);
     let out_side = side * scale;
     anyhow::ensure!(out_side <= 4096, "GIF would be {out_side}px wide; keep side × scale ≤ 4096");
+    if let Some(i) = frames.iter().position(|f| f.len() != side * side * 4) {
+        anyhow::bail!("frame {i} is not {side}×{side} RGBA");
+    }
 
     // ── palette: [bg/transparent] + every colour the renderer can emit, padded to 256
     let colours = sprite_core::Palette::new().output_colors();
-    let mut table: Vec<[u8; 3]> = Vec::with_capacity(256);
-    table.push(o.bg.unwrap_or([0, 0, 0]));
-    table.extend(&colours);
-    let mut lookup: HashMap<[u8; 3], u8> = colours.iter().enumerate().map(|(i, c)| (*c, (i + 1) as u8)).collect();
-    let flat: Vec<u8> = table.iter().flatten().copied().chain(std::iter::repeat(0)).take(768).collect();
+    let flat: Vec<u8> = std::iter::once(o.bg.unwrap_or([0, 0, 0])).chain(colours.iter().copied()).flatten().chain(std::iter::repeat(0)).take(768).collect();
+    let mut index = Indexer::new(&colours);
 
     // ── play order
     let n = frames.len();
@@ -204,73 +206,124 @@ pub fn encode_gif(frames: &[&[u8]], side: usize, durations: &[u32], o: &GifOpts)
         order.extend((1..n - 1).rev());
     }
 
-    // ── index each frame (upscaled), merging identical neighbours
-    let mut out_frames: Vec<(Vec<u8>, u32)> = Vec::new();
-    for &i in &order {
-        let src = frames[i];
-        anyhow::ensure!(src.len() == side * side * 4, "frame {i} is not {side}×{side} RGBA");
-        let mut idx = vec![0u8; out_side * out_side];
-        for y in 0..side {
-            for x in 0..side {
-                let p = &src[(y * side + x) * 4..(y * side + x) * 4 + 4];
-                let v = if p[3] == 0 {
-                    0
-                } else {
-                    let c = [p[0], p[1], p[2]];
-                    match lookup.get(&c) {
-                        Some(&v) => v,
-                        None => {
-                            // not a renderer colour (shouldn't happen); use the nearest one
-                            let v = nearest(&colours, c) as u8 + 1;
-                            lookup.insert(c, v);
-                            v
-                        }
-                    }
-                };
-                for yy in 0..scale {
-                    let row = (y * scale + yy) * out_side + x * scale;
-                    idx[row..row + scale].fill(v);
-                }
-            }
-        }
-        let ms = durations.get(i).copied().unwrap_or(110);
-        match out_frames.last_mut() {
-            Some((prev, d)) if *prev == idx => *d += ms,
-            _ => out_frames.push((idx, ms)),
-        }
-    }
-
-    // ── write
     let mut out = Vec::new();
-    let mut total_ms = 0u32;
+    let mut w = FrameWriter { side: out_side as u16, transparent: o.bg.is_none().then_some(0), total_ms: 0, t_cs: 0, written: 0 };
     {
-        let s16 = out_side as u16;
-        let mut enc = gif::Encoder::new(&mut out, s16, s16, &flat)?;
+        let mut enc = gif::Encoder::new(&mut out, w.side, w.side, &flat)?;
         // The loop extension counts *re*plays and 0 means forever, so "play once" omits it entirely.
         match o.repeat {
             None => enc.set_repeat(gif::Repeat::Infinite)?,
             Some(k) if k > 1 => enc.set_repeat(gif::Repeat::Finite(k - 1))?,
             Some(_) => {}
         }
-        let mut t_cs = 0u32; // running total, in GIF centiseconds
-        for (idx, ms) in &out_frames {
-            total_ms += ms;
-            let end_cs = (total_ms + 5) / 10;
-            let delay = end_cs.saturating_sub(t_cs).max(2); // browsers turn delays < 2cs into 10cs
-            t_cs += delay;
+        // index each frame (upscaled) into `cur`; merge it into `pending` if identical, else flush
+        let mut pending = vec![0u8; out_side * out_side];
+        let mut cur = vec![0u8; out_side * out_side];
+        let mut pending_ms: Option<u64> = None;
+        for &i in &order {
+            index.frame(frames[i], side, scale, &mut cur);
+            let ms = durations.get(i).copied().unwrap_or(110) as u64;
+            match pending_ms.as_mut() {
+                Some(d) if pending == cur => *d += ms,
+                _ => {
+                    if let Some(d) = pending_ms {
+                        w.write(&mut enc, &pending, d)?;
+                    }
+                    std::mem::swap(&mut pending, &mut cur);
+                    pending_ms = Some(ms);
+                }
+            }
+        }
+        if let Some(d) = pending_ms {
+            w.write(&mut enc, &pending, d)?;
+        }
+    }
+    Ok((out, GifInfo { side: out_side, frames: w.written, loop_ms: w.total_ms }))
+}
+
+/// RGBA → palette index, remembering the last colour (sprites have long runs of one colour).
+struct Indexer<'a> {
+    colours: &'a [[u8; 3]],
+    lookup: HashMap<[u8; 3], u8>,
+    last: Option<([u8; 3], u8)>,
+}
+
+impl<'a> Indexer<'a> {
+    fn new(colours: &'a [[u8; 3]]) -> Self {
+        let lookup = colours.iter().enumerate().map(|(i, c)| (*c, (i + 1) as u8)).collect();
+        Indexer { colours, lookup, last: None }
+    }
+
+    fn index(&mut self, c: [u8; 3]) -> u8 {
+        if let Some((lc, li)) = self.last {
+            if lc == c {
+                return li;
+            }
+        }
+        let v = match self.lookup.get(&c) {
+            Some(&v) => v,
+            None => {
+                debug_assert!(false, "colour {c:?} is not in Palette::output_colors()");
+                let v = nearest(self.colours, c) as u8 + 1;
+                self.lookup.insert(c, v);
+                v
+            }
+        };
+        self.last = Some((c, v));
+        v
+    }
+
+    /// Index one `side`×`side` RGBA frame into `out`, upscaled `scale`× (nearest neighbour).
+    fn frame(&mut self, src: &[u8], side: usize, scale: usize, out: &mut [u8]) {
+        let out_side = side * scale;
+        for y in 0..side {
+            let row0 = y * scale * out_side;
+            for x in 0..side {
+                let p = &src[(y * side + x) * 4..(y * side + x) * 4 + 4];
+                let v = if p[3] == 0 { 0 } else { self.index([p[0], p[1], p[2]]) };
+                out[row0 + x * scale..row0 + (x + 1) * scale].fill(v);
+            }
+            // the other rows of this sprite row are copies of the first
+            for yy in 1..scale {
+                out.copy_within(row0..row0 + out_side, row0 + yy * out_side);
+            }
+        }
+    }
+}
+
+/// Writes frames with delays rounded on the running total. GIF delays are u16 centiseconds, so a
+/// frame longer than 655.35 s is written as several identical frames.
+struct FrameWriter {
+    side: u16,
+    transparent: Option<u8>,
+    total_ms: u64,
+    t_cs: u64,
+    written: usize,
+}
+
+impl FrameWriter {
+    fn write<W: std::io::Write>(&mut self, enc: &mut gif::Encoder<W>, idx: &[u8], ms: u64) -> Result<()> {
+        self.total_ms += ms;
+        let end_cs = (self.total_ms + 5) / 10;
+        let mut delay = end_cs.saturating_sub(self.t_cs).max(2); // browsers turn delays < 2cs into 10cs
+        self.t_cs += delay;
+        while delay > 0 {
+            let d = delay.min(u16::MAX as u64);
+            delay -= d;
             let fr = gif::Frame {
-                width: s16,
-                height: s16,
-                delay: delay.min(u16::MAX as u32) as u16,
+                width: self.side,
+                height: self.side,
+                delay: d as u16,
                 dispose: gif::DisposalMethod::Background,
-                transparent: if o.bg.is_none() { Some(0) } else { None },
+                transparent: self.transparent,
                 buffer: std::borrow::Cow::Borrowed(idx),
                 ..gif::Frame::default()
             };
             enc.write_frame(&fr)?;
+            self.written += 1;
         }
+        Ok(())
     }
-    Ok((out, GifInfo { side: out_side, frames: out_frames.len(), loop_ms: total_ms }))
 }
 
 fn nearest(colours: &[[u8; 3]], c: [u8; 3]) -> usize {
@@ -280,10 +333,11 @@ fn nearest(colours: &[[u8; 3]], c: [u8; 3]) -> usize {
 
 /// Parse a background argument: "transparent"/"none"/"" → None, "#rrggbb" or "rrggbb" → colour.
 pub fn parse_bg(s: &str) -> std::result::Result<Option<[u8; 3]>, String> {
-    let t = s.trim().trim_start_matches('#');
-    if t.is_empty() || t.eq_ignore_ascii_case("transparent") || t.eq_ignore_ascii_case("none") {
+    let s = s.trim();
+    if s.is_empty() || s.eq_ignore_ascii_case("transparent") || s.eq_ignore_ascii_case("none") {
         return Ok(None);
     }
+    let t = s.strip_prefix('#').unwrap_or(s);
     if t.len() != 6 || !t.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(format!("bg must be \"transparent\" or a hex colour like #f6f5f0, not {s:?}"));
     }
@@ -439,11 +493,35 @@ mod tests {
     }
 
     #[test]
+    fn frames_longer_than_a_gif_delay_are_split() {
+        // 10 s × hold 100 = 1000 s per frame; one GIF delay tops out at 655.35 s
+        let (s, f) = sprite(serde_json::json!({"name": "b", "anim": "spin", "frames": 2, "ms": 10000, "hold": [100, 1],
+            "prims": [{"t": "star", "c": [16, 16], "r": 12, "m": "gold"}]}));
+        let (bytes, info) = gif(&f, &durations(&s, f.len()), &GifOpts::default()).unwrap();
+        let d = decode(&bytes);
+        assert_eq!(d.delays, vec![65535, 34465, 1000]);
+        assert_eq!(info.loop_ms, 1_010_000);
+        assert_eq!(info.frames, 3);
+    }
+
+    #[test]
+    fn upscale_matches_the_source_pixels() {
+        let (s, f) = sprite(serde_json::json!({"name": "b", "prims": [{"t": "ellipse", "c": [16, 16], "r": 10, "m": "red"}]}));
+        let d = decode(&gif(&f, &durations(&s, 1), &GifOpts { scale: 3, ..Default::default() }).unwrap().0);
+        for y in 0..96 {
+            for x in 0..96 {
+                let src_opaque = f[0].0[((y / 3) * 32 + x / 3) * 4 + 3] > 0;
+                assert_eq!(d.first[y * 96 + x] != 0, src_opaque, "pixel ({x},{y})");
+            }
+        }
+    }
+
+    #[test]
     fn parse_bg_accepts_hex_and_transparent() {
         assert_eq!(parse_bg("transparent").unwrap(), None);
         assert_eq!(parse_bg("").unwrap(), None);
         assert_eq!(parse_bg("#F6f5f0").unwrap(), Some([246, 245, 240]));
         assert_eq!(parse_bg("102030").unwrap(), Some([16, 32, 48]));
-        assert!(parse_bg("red").is_err() && parse_bg("#fff").is_err());
+        assert!(parse_bg("red").is_err() && parse_bg("#fff").is_err() && parse_bg("#").is_err());
     }
 }
