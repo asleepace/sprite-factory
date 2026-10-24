@@ -16,6 +16,8 @@ fixed top-left light produce the shading.
 - Minimum readable feature ≈ 1.5px wide. Thinner things vanish unless you give them `"weight": 3`
   or draw them as `px` pixels.
 - Fewer, bigger shapes beat many tiny ones. Typical sprite: 4–14 primitives.
+- Hard limits (the spec is rejected past these): 64 prims, 256 points per prim, 1024 `px` points in
+  total, `smooth` ≤ 4, `n` 3–64, coordinates within −64…96, and prims × frames ≤ 1024.
 
 ## Spec format (one JSON array per file, one object per sprite)
 ```json

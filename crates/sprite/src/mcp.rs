@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::imgio::{self, Rgba, BACKDROP};
 use crate::library;
+use crate::store;
 
 const CATEGORIES: [&str; 8] = ["animals", "food", "home", "nature", "vehicles", "places", "people", "misc"];
 const MATERIALS: [&str; 24] = [
@@ -76,7 +77,7 @@ fn prim_schema() -> Value {
             "c": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2, "description": "centre [x,y]"},
             "r": {"description": "radius or [rx,ry]", "anyOf": [{"type": "number"}, {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2}]},
             "p": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4, "description": "rect [x0,y0,x1,y1]"},
-            "pts": {"type": "array", "items": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2}},
+            "pts": {"type": "array", "maxItems": sprite_core::spec::limits::MAX_PTS, "items": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2}},
             "w": {"type": "number", "description": "line width"},
             "puff": {"type": "number"}, "height": {"type": "number"}, "round": {"type": "number"},
             "smooth": {"type": "integer", "minimum": 0, "maximum": 4},
@@ -86,7 +87,7 @@ fn prim_schema() -> Value {
             "rot": {"type": "number"}, "cut": {"type": "boolean"}, "clip": {"type": "integer"},
             "lit": {"type": "boolean"}, "cap": {"type": "boolean"},
             "g": {"type": "string", "description": "animation group"},
-            "r2": {"type": "number"}, "n": {"type": "integer"}, "a": {"type": "number"},
+            "r2": {"type": "number"}, "n": {"type": "integer", "minimum": 3, "maximum": 64}, "a": {"type": "number"},
             "a0": {"type": "number"}, "a1": {"type": "number"}, "pie": {"type": "boolean"}
         },
         "required": ["t"],
@@ -161,8 +162,8 @@ fn tools() -> Vec<Tool> {
                 "category": {"type": "string", "enum": CATEGORIES},
                 "aka": {"type": "array", "items": {"type": "string"}, "description": "other words a child might use (bunny for rabbit); used by blind_review"},
                 "anim": anim_schema(),
-                "tracks": {"type": "array", "items": track_schema()},
-                "prims": {"type": "array", "items": prim_schema(), "minItems": 1, "maxItems": 40},
+                "tracks": {"type": "array", "items": track_schema(), "maxItems": sprite_core::spec::limits::MAX_TRACKS},
+                "prims": {"type": "array", "items": prim_schema(), "minItems": 1, "maxItems": sprite_core::spec::limits::MAX_PRIMS},
                 "overwrite": {"type": "boolean"}
             })), &["name", "category", "prims"])),
         t("edit_sprite", "Edit sprite",
@@ -170,9 +171,10 @@ fn tools() -> Vec<Tool> {
             obj(with_timing(json!({
                 "name": name_schema(),
                 "anim": anim_schema(),
-                "tracks": {"type": "array", "items": track_schema()},
+                "tracks": {"type": "array", "items": track_schema(), "maxItems": sprite_core::spec::limits::MAX_TRACKS},
                 "aka": {"type": "array", "items": {"type": "string"}},
-                "prims": {"type": "array", "items": prim_schema(), "minItems": 1, "maxItems": 40},
+                "prims": {"type": "array", "items": prim_schema(), "minItems": 1, "maxItems": sprite_core::spec::limits::MAX_PRIMS},
+                "if_rev": {"type": "integer", "minimum": 0, "description": "the rev you read (from get_sprite or the last create/edit); the edit is refused if someone saved since"},
                 "prim_ops": {"type": "array", "items": {"type": "object", "properties": {
                     "op": {"type": "string", "enum": ["set", "merge", "insert", "delete"]},
                     "index": {"type": "integer", "minimum": 0},
@@ -181,7 +183,12 @@ fn tools() -> Vec<Tool> {
             })), &["name"])),
         t("render_sprite", "Render sprite", "Renders an existing sprite without changing it.",
             obj(json!({"name": name_schema(), "scale": {"type": "integer", "minimum": 1, "maximum": 16}}), &["name"])),
-        t("delete_sprite", "Delete sprite", "Removes a sprite from the library. Cannot be undone.", obj(json!({"name": name_schema()}), &["name"])),
+        t("delete_sprite", "Delete sprite", "Removes a sprite from the library. Its history is kept, so restore_sprite can bring it back.", obj(json!({"name": name_schema()}), &["name"])),
+        t("sprite_history", "Sprite history", "Lists a sprite's saved revisions (rev, what changed, who, when), including sprites that were deleted.",
+            obj(json!({"name": name_schema()}), &["name"])),
+        t("restore_sprite", "Restore sprite",
+            "Puts a sprite back to an earlier revision (saved as a new revision, so nothing is lost). Also undeletes. Returns the render.",
+            obj(json!({"name": name_schema(), "rev": {"type": "integer", "minimum": 0}}), &["name", "rev"])),
         t("blind_review", "Blind review",
             "Tests whether sprites are recognisable without their names: a fresh model sees an unlabeled, shuffled sheet and its guesses are graded. Uses ANTHROPIC_API_KEY if set, else MCP sampling, else returns the sheet and key for a separate reviewer.",
             obj(json!({"names": {"type": "array", "items": name_schema(), "minItems": 1, "maxItems": 30}}), &["names"])),
@@ -202,6 +209,7 @@ fn tools() -> Vec<Tool> {
                 "names": {"type": "array", "items": name_schema()},
                 "category": {"type": "string", "enum": CATEGORIES},
                 "scale": {"type": "integer", "minimum": 1, "maximum": 8},
+                "max_side": {"type": "integer", "minimum": 256, "maximum": library::ATLAS_SIDE_LIMIT, "description": "largest atlas width/height in px (default 4096, which every GPU loads)"},
                 "file": {"type": "string", "pattern": "^[a-z0-9_-]{1,40}$"}
             }), &[])),
     ]
@@ -268,6 +276,22 @@ fn render_result(v: &Value, headline: &str, scale: usize) -> ToolOut {
     Ok(CallToolResult::success(content))
 }
 
+/// Replace the first line of a render_result's text (used once the save tells us the rev).
+fn set_headline(res: &mut CallToolResult, head: &str) {
+    if let Some(ContentBlock::Text(t)) = res.content.first_mut() {
+        t.text = format!("{head}{}", t.text);
+    }
+}
+
+/// Who is calling: the token label under `sprite serve`, or "local" over stdio.
+fn caller(ctx: &RequestContext<RoleServer>) -> String {
+    ctx.extensions
+        .get::<axum::http::request::Parts>()
+        .and_then(|p| p.extensions.get::<crate::http::Caller>())
+        .map(|c| c.0.clone())
+        .unwrap_or_else(|| "local".into())
+}
+
 impl SpriteServer {
     fn path(&self, name: &str) -> PathBuf {
         self.lib.join(format!("{name}.json"))
@@ -282,19 +306,34 @@ impl SpriteServer {
         serde_json::from_str(&s).map_err(|e| format!("{name}.json is not valid JSON: {e}"))
     }
 
-    fn save(&self, v: &Value) -> Result<(), String> {
-        let name = library::spec_name(v);
-        std::fs::write(self.path(name), serde_json::to_string_pretty(v).unwrap() + "\n").map_err(|e| e.to_string())
+    fn all(&self) -> (Vec<Value>, Vec<String>) {
+        store::load_all(&self.lib)
     }
 
-    fn all(&self) -> Vec<Value> {
-        library::load_specs(&[self.lib.as_ref().clone()]).unwrap_or_default()
+    /// Save `v` as a new revision, failing if the sprite moved past `expect_rev` (the rev the
+    /// caller started from; None = must not exist yet). The lock is held only for the check and
+    /// the write, never while rendering.
+    fn commit(&self, name: &str, v: &mut Value, expect_rev: Option<u64>, op: &str, who: &str) -> Result<u64, String> {
+        let _g = store::lock();
+        let current = std::fs::read(self.path(name)).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+        match (expect_rev, &current) {
+            (None, Some(_)) => return Err(format!("\"{name}\" was created by someone else just now. Use edit_sprite, or pass overwrite: true.")),
+            (Some(want), Some(cur)) if store::rev_of(cur) != want => {
+                return Err(format!(
+                    "\"{name}\" changed while you were editing (now rev {}, you started from rev {want}). Nothing was saved; get_sprite and redo the edit.",
+                    store::rev_of(cur)
+                ))
+            }
+            (Some(_), None) if op == "edit" => return Err(format!("\"{name}\" was deleted while you were editing. Nothing was saved.")),
+            _ => {}
+        }
+        store::save(&self.lib, name, v, op, who)
     }
 
     // ── tools ──
 
     fn list_sprites(&self, a: &Map<String, Value>) -> ToolOut {
-        let mut specs = self.all();
+        let (mut specs, broken) = self.all();
         if let Some(c) = arg_str(a, "category") {
             specs.retain(|s| s.get("cat").and_then(Value::as_str) == Some(c));
         }
@@ -311,7 +350,11 @@ impl SpriteServer {
         } else {
             by_cat.iter().map(|(c, ns)| format!("{c} ({}): {}", ns.len(), ns.join(", "))).collect::<Vec<_>>().join("\n")
         };
-        let mut content = vec![text(format!("{} sprites\n{summary}", specs.len()))];
+        let mut head = format!("{} sprites\n{summary}", specs.len());
+        if !broken.is_empty() {
+            head.push_str(&format!("\n\n{} file(s) could not be read and were skipped:\n- {}", broken.len(), broken.join("\n- ")));
+        }
+        let mut content = vec![text(head)];
         if a.get("sheet").and_then(Value::as_bool).unwrap_or(false) && !specs.is_empty() {
             let items: Vec<(String, Frame)> = specs
                 .iter()
@@ -322,7 +365,7 @@ impl SpriteServer {
         Ok(CallToolResult::success(content))
     }
 
-    fn create_sprite(&self, a: &Map<String, Value>) -> ToolOut {
+    fn create_sprite(&self, a: &Map<String, Value>, who: &str) -> ToolOut {
         let name = arg_str(a, "name").unwrap_or_default();
         if !valid_name(name) {
             return Err("name must be lowercase snake_case, e.g. teddy_bear".into());
@@ -331,9 +374,12 @@ impl SpriteServer {
         if !CATEGORIES.contains(&cat) {
             return Err(format!("category must be one of {CATEGORIES:?}"));
         }
-        if self.path(name).exists() && !a.get("overwrite").and_then(Value::as_bool).unwrap_or(false) {
+        let overwrite = a.get("overwrite").and_then(Value::as_bool).unwrap_or(false);
+        let existing = std::fs::read(self.path(name)).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+        if existing.is_some() && !overwrite {
             return Err(format!("\"{name}\" already exists. Use edit_sprite, or pass overwrite: true to replace it."));
         }
+        let was_deleted = store::is_deleted(&self.lib, name);
         let mut spec = Map::new();
         spec.insert("name".into(), json!(name));
         spec.insert("cat".into(), json!(cat));
@@ -348,15 +394,30 @@ impl SpriteServer {
         }
         spec.insert("tracks".into(), a.get("tracks").cloned().unwrap_or(json!([])));
         spec.insert("prims".into(), a.get("prims").cloned().unwrap_or(json!([])));
-        let v = Value::Object(spec);
-        let res = render_result(&v, &format!("Created \"{name}\"."), 8)?;
-        self.save(&v)?;
+        let mut v = Value::Object(spec);
+        // validate + render before touching the library
+        let mut res = render_result(&v, "", 8)?;
+        let expect = existing.as_ref().map(store::rev_of);
+        let rev = self.commit(name, &mut v, expect, if expect.is_some() { "overwrite" } else { "create" }, who)?;
+        let mut head = format!("Created \"{name}\" (rev {rev}).");
+        if was_deleted {
+            head.push_str(" A deleted sprite had this name; its old revisions are still in sprite_history.");
+        }
+        set_headline(&mut res, &head);
         Ok(res)
     }
 
-    fn edit_sprite(&self, a: &Map<String, Value>) -> ToolOut {
+    fn edit_sprite(&self, a: &Map<String, Value>, who: &str) -> ToolOut {
         let name = arg_str(a, "name").unwrap_or_default();
         let mut v = self.load(name)?;
+        let base_rev = store::rev_of(&v);
+        if let Some(want) = a.get("if_rev").and_then(Value::as_u64) {
+            if want != base_rev {
+                return Err(format!(
+                    "\"{name}\" is at rev {base_rev}, not {want}: someone saved since you read it. Nothing was changed; get_sprite and redo the edit."
+                ));
+            }
+        }
         let o = v.as_object_mut().ok_or("stored spec is not an object")?;
         for k in ["anim", "tracks", "aka", "prims"] {
             if let Some(x) = a.get(k) {
@@ -406,8 +467,57 @@ impl SpriteServer {
                 }
             }
         }
-        let res = render_result(&v, &format!("Updated \"{name}\"."), 8)?;
-        self.save(&v)?;
+        let mut res = render_result(&v, "", 8)?;
+        let rev = self.commit(name, &mut v, Some(base_rev), "edit", who)?;
+        set_headline(&mut res, &format!("Updated \"{name}\" (rev {rev})."));
+        Ok(res)
+    }
+
+    fn delete_sprite(&self, a: &Map<String, Value>, who: &str) -> ToolOut {
+        let n = arg_str(a, "name").unwrap_or_default();
+        self.load(n)?;
+        let rev = {
+            let _g = store::lock();
+            store::delete(&self.lib, n, who)?
+        };
+        Ok(CallToolResult::success(vec![text(format!(
+            "Deleted \"{n}\" (was rev {rev}). Undo with restore_sprite {{\"name\": \"{n}\", \"rev\": {rev}}}."
+        ))]))
+    }
+
+    fn sprite_history(&self, a: &Map<String, Value>) -> ToolOut {
+        let n = arg_str(a, "name").unwrap_or_default();
+        if !valid_name(n) {
+            return Err(format!("\"{n}\" is not a valid sprite name (lowercase snake_case)"));
+        }
+        let revs = store::revisions(&self.lib, n);
+        if revs.is_empty() {
+            return Err(format!("No history for \"{n}\"."));
+        }
+        let live = std::fs::read(self.path(n)).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).map(|v| store::rev_of(&v));
+        let lines: Vec<String> = revs
+            .iter()
+            .map(|r| format!("rev {:>3}  {:<9} {:<12} {}{}", r.rev, r.op, r.by, r.at, if Some(r.rev) == live { "  ← current" } else { "" }))
+            .collect();
+        let status = if live.is_some() { "" } else { "\n(currently deleted — restore_sprite brings any revision back)" };
+        Ok(CallToolResult::success(vec![text(format!("{n}: {} revision(s){status}\n{}", revs.len(), lines.join("\n")))]))
+    }
+
+    fn restore_sprite(&self, a: &Map<String, Value>, who: &str) -> ToolOut {
+        let n = arg_str(a, "name").unwrap_or_default();
+        if !valid_name(n) {
+            return Err(format!("\"{n}\" is not a valid sprite name (lowercase snake_case)"));
+        }
+        let rev = a.get("rev").and_then(Value::as_u64).ok_or("rev is required")?;
+        let mut v = store::load_rev(&self.lib, n, rev)?;
+        let mut res = render_result(&v, "", 8)?;
+        let current = std::fs::read(self.path(n)).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).map(|v| store::rev_of(&v));
+        let new = {
+            let _g = store::lock();
+            store::save(&self.lib, n, &mut v, "restore", who)?
+        };
+        let from = current.map(|c| format!("from rev {c} ")).unwrap_or_else(|| "from the trash ".into());
+        set_headline(&mut res, &format!("Restored \"{n}\" {from}to the shapes of rev {rev}, saved as rev {new}."));
         Ok(res)
     }
 
@@ -433,7 +543,7 @@ impl SpriteServer {
         let dir = self.lib.join("_export");
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let path = dir.join(format!("{name}.gif"));
-        std::fs::write(&path, &gif).map_err(|e| e.to_string())?;
+        store::write_atomic(&path, &gif).map_err(|e| e.to_string())?;
 
         let mut lines = vec![format!(
             "GIF for \"{name}\": {side}×{side}px, {n} frame{s} ({src} rendered), {ms} ms per loop{bg}{pp}{rep}, {kb:.1} KB.",
@@ -483,7 +593,7 @@ impl SpriteServer {
     }
 
     fn export_atlas(&self, a: &Map<String, Value>) -> ToolOut {
-        let mut specs = self.all();
+        let (mut specs, _) = self.all();
         if let Some(names) = a.get("names").and_then(Value::as_array) {
             let want: Vec<&str> = names.iter().filter_map(Value::as_str).collect();
             specs.retain(|s| want.contains(&library::spec_name(s)));
@@ -504,29 +614,25 @@ impl SpriteServer {
         let dir = self.lib.join("_export");
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let png_name = format!("{base}.png");
-        let (img, meta) = library::atlas(&rendered, scale, &png_name).map_err(|e| e.to_string())?;
+        let max_side = a.get("max_side").and_then(Value::as_u64).map(|m| m as usize).unwrap_or(library::ATLAS_MAX_SIDE).clamp(256, library::ATLAS_SIDE_LIMIT);
+        let (img, meta) = library::atlas(&rendered, scale, &png_name, max_side).map_err(|e| e.to_string())?;
         let png_path = dir.join(&png_name);
         let json_path = dir.join(format!("{base}.json"));
-        std::fs::write(&png_path, img.png().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-        std::fs::write(&json_path, serde_json::to_string_pretty(&meta).unwrap()).map_err(|e| e.to_string())?;
+        store::write_atomic(&png_path, &img.png().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        store::write_atomic(&json_path, serde_json::to_string_pretty(&meta).unwrap().as_bytes()).map_err(|e| e.to_string())?;
         let frames: usize = rendered.iter().map(|r| r.1.len()).sum();
+        // preview: a 1× copy, doubled only while it stays small
         let preview = {
-            let mut small = Rgba::new(img.w / scale, img.h / scale);
-            for (r, (_, fr)) in rendered.iter().enumerate() {
-                for (k, f) in fr.iter().enumerate() {
-                    small.blit_frame(f, k * sprite_core::SIZE, r * sprite_core::SIZE, 1);
-                }
-            }
-            small.scaled(2).on_backdrop(BACKDROP).png().map_err(|e| e.to_string())?
+            let (small, _) = library::atlas(&rendered, 1, &png_name, library::ATLAS_SIDE_LIMIT).map_err(|e| e.to_string())?;
+            let k = if small.w.max(small.h) <= 1024 { 2 } else { 1 };
+            small.scaled(k).on_backdrop(BACKDROP).png().map_err(|e| e.to_string())?
         };
         Ok(CallToolResult::success(vec![
             text(format!(
-                "Exported {} sprites, {frames} frames, {}×{}px.\n{}\n{}",
+                "Exported {} sprites, {frames} frames, {}×{}px, to _export/{png_name} and _export/{base}.json in the sprite library.",
                 rendered.len(),
                 img.w,
                 img.h,
-                png_path.display(),
-                json_path.display()
             )),
             image_b64(&preview),
         ]))
@@ -738,6 +844,7 @@ impl ServerHandler for SpriteServer {
     async fn call_tool(&self, request: CallToolRequestParams, context: RequestContext<RoleServer>) -> Result<CallToolResponse, McpError> {
         let args = request.arguments.clone().unwrap_or_default();
         let this = self.clone();
+        let who = caller(&context);
         let name = request.name.to_string();
         let out: Result<CallToolResponse, String> = match name.as_str() {
             "blind_review" => self.blind_review(&args, &request, &context).await,
@@ -748,19 +855,15 @@ impl ServerHandler for SpriteServer {
                 Ok(CallToolResult::success(vec![text(guide), text(format!("materials (shade 0→4): {}", Value::Object(pal)))]).into())
             }
             "get_sprite" => self.load(arg_str(&args, "name").unwrap_or_default()).map(|v| CallToolResult::success(vec![text(serde_json::to_string_pretty(&v).unwrap())]).into()),
-            "delete_sprite" => {
-                let n = arg_str(&args, "name").unwrap_or_default().to_string();
-                match self.load(&n) {
-                    Ok(_) => std::fs::remove_file(self.path(&n)).map(|_| CallToolResult::success(vec![text(format!("Deleted \"{n}\"."))]).into()).map_err(|e| e.to_string()),
-                    Err(e) => Err(e),
-                }
-            }
-            // CPU-bound tools run off the async executor
-            "list_sprites" | "create_sprite" | "edit_sprite" | "render_sprite" | "export_gif" | "export_atlas" => {
+            "delete_sprite" => self.delete_sprite(&args, &who).map(Into::into),
+            "sprite_history" => self.sprite_history(&args).map(Into::into),
+            // CPU-bound tools (and anything that takes the write lock) run off the async executor
+            "list_sprites" | "create_sprite" | "edit_sprite" | "restore_sprite" | "render_sprite" | "export_gif" | "export_atlas" => {
                 let res = tokio::task::spawn_blocking(move || match name.as_str() {
                     "list_sprites" => this.list_sprites(&args),
-                    "create_sprite" => this.create_sprite(&args),
-                    "edit_sprite" => this.edit_sprite(&args),
+                    "create_sprite" => this.create_sprite(&args, &who),
+                    "edit_sprite" => this.edit_sprite(&args, &who),
+                    "restore_sprite" => this.restore_sprite(&args, &who),
                     "export_gif" => this.export_gif(&args),
                     "render_sprite" => {
                         let n = arg_str(&args, "name").unwrap_or_default();

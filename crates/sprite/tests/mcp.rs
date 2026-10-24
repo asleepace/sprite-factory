@@ -86,7 +86,7 @@ async fn tools_and_editing() {
     let lib = library();
     let c = connect(Reviewer::default(), &lib, &[]).await;
     let tools: Vec<String> = c.list_all_tools().await.unwrap().into_iter().map(|t| t.name.to_string()).collect();
-    for t in ["style_guide", "list_sprites", "get_sprite", "create_sprite", "edit_sprite", "render_sprite", "delete_sprite", "blind_review", "export_gif", "export_atlas"] {
+    for t in ["style_guide", "list_sprites", "get_sprite", "create_sprite", "edit_sprite", "render_sprite", "delete_sprite", "sprite_history", "restore_sprite", "blind_review", "export_gif", "export_atlas"] {
         assert!(tools.contains(&t.to_string()), "missing tool {t}");
     }
     seed(&c).await;
@@ -130,8 +130,50 @@ async fn tools_and_editing() {
     let atlas = call(&c, "export_atlas", json!({"file": "home", "scale": 2})).await;
     assert!(text_of(&atlas).contains("Exported 2 sprites"), "{}", text_of(&atlas));
     assert!(lib.join("_export/home.json").exists());
+    assert!(!text_of(&atlas).contains(lib.to_str().unwrap()), "server paths stay private");
+    let huge = call(&c, "export_atlas", json!({"scale": 8, "max_side": 256})).await;
+    assert!(text_of(&huge).contains("over the 256px limit"), "{}", text_of(&huge));
     let traversal = call(&c, "get_sprite", json!({"name": "../etc/passwd"})).await;
     assert_eq!(traversal.is_error, Some(true));
+    c.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn history_restore_and_conflicts() {
+    let lib = library();
+    let c = connect(Reviewer::default(), &lib, &[]).await;
+    seed(&c).await;
+    let rev = |v: &Value| v["rev"].as_u64().unwrap();
+    let get = |n: &'static str| {
+        let c = &c;
+        async move { serde_json::from_str::<Value>(&text_of(&call(c, "get_sprite", json!({"name": n})).await)).unwrap() }
+    };
+    assert_eq!(rev(&get("jar").await), 1);
+
+    // an edit based on a stale rev is refused and changes nothing
+    let ok = call(&c, "edit_sprite", json!({"name": "jar", "if_rev": 1, "prim_ops": [{"op": "merge", "index": 0, "prim": {"m": "pink"}}]})).await;
+    assert!(text_of(&ok).contains("(rev 2)"), "{}", text_of(&ok));
+    let stale = call(&c, "edit_sprite", json!({"name": "jar", "if_rev": 1, "prim_ops": [{"op": "merge", "index": 0, "prim": {"m": "lime"}}]})).await;
+    assert_eq!(stale.is_error, Some(true));
+    assert!(text_of(&stale).contains("is at rev 2"), "{}", text_of(&stale));
+    assert_eq!(get("jar").await["prims"][0]["m"], "pink");
+
+    // delete goes to the trash and is undoable
+    let del = call(&c, "delete_sprite", json!({"name": "jar"})).await;
+    assert!(text_of(&del).contains("restore_sprite"), "{}", text_of(&del));
+    assert!(!lib.join("jar.json").exists());
+    let hist = text_of(&call(&c, "sprite_history", json!({"name": "jar"})).await);
+    assert!(hist.contains("currently deleted") && hist.contains("rev   1  create") && hist.contains("local"), "{hist}");
+    let back = call(&c, "restore_sprite", json!({"name": "jar", "rev": 1})).await;
+    assert_ne!(back.is_error, Some(true), "{}", text_of(&back));
+    assert!(back.content.iter().any(|c| matches!(c, ContentBlock::Image(_))));
+    let restored = get("jar").await;
+    assert_eq!((rev(&restored), restored["prims"][0]["m"].clone()), (3, json!("glass")));
+
+    // a corrupt file is reported, not mistaken for an empty library
+    std::fs::write(lib.join("broken.json"), "{ nope").unwrap();
+    let list = text_of(&call(&c, "list_sprites", json!({})).await);
+    assert!(list.starts_with("2 sprites") && list.contains("broken.json"), "{list}");
     c.cancel().await.unwrap();
 }
 

@@ -29,8 +29,9 @@ sprite render  testdata/nouns/*.json --out out/          # PNG + strip + GIF per
 sprite hd      testdata/nouns/*.json --size 512 --out hd/ # the same specs redrawn in high definition (64–1024px)
 sprite sheet   testdata/nouns/food.json --out food.png   # labelled contact sheet (--numbered for blind review)
 sprite strips  testdata/nouns/food.json --out anim.png   # every animation frame
-sprite atlas   library/ --out atlas --scale 2            # atlas.png + atlas.json (Phaser/Pixi JSON hash)
+sprite atlas   library/ --out atlas --scale 2            # atlas.png + atlas.json (Phaser/Pixi JSON hash), ≤ 4096px a side
 sprite palette --out palette.png                         # or no --out for JSON
+sprite check   /var/lib/sprite/library                   # validate specs (limits included) without rendering
 sprite golden  testdata/golden testdata/nouns/*.json     # parity report vs reference renders
 sprite bench   testdata/nouns/*.json
 ```
@@ -61,8 +62,14 @@ claude mcp add --transport http sprite-factory https://sprites.example.com/mcp -
 ```
 
 Tools: `style_guide`, `list_sprites`, `get_sprite`, `create_sprite`, `edit_sprite`, `render_sprite`,
-`delete_sprite`, `blind_review`, `export_gif`, `export_atlas`. Every create/edit returns the rendered sprite,
-its animation frames and measured style warnings, so the model sees its work and revises.
+`delete_sprite`, `sprite_history`, `restore_sprite`, `blind_review`, `export_gif`, `export_atlas`. Every
+create/edit returns the rendered sprite, its animation frames and measured style warnings, so the model sees
+its work and revises.
+
+Every save is a numbered revision (`rev` in the spec) kept under `_history/`, and deletes go to `_trash/`,
+so any change can be undone with `restore_sprite`. `edit_sprite` takes `if_rev` and refuses to overwrite a
+newer save. Specs are bounded (prims, points, smoothing, coordinates, prims × frames; see
+`sprite_core::spec::limits`) so a single spec can't exhaust the server.
 `export_gif` returns the animated GIF inline (exact palette, transparent by default) and, when
 `SPRITE_PUBLIC_URL` is set, a download URL for it.
 
