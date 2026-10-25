@@ -26,6 +26,8 @@ cargo build --release
 The build needs about 1 GB of RAM. On a small droplet, add swap first or build on a matching Ubuntu machine and copy `target/release/sprite` over.
 
 To upgrade later: `cd /opt/src/sprite-factory && git pull && cargo build --release && sudo ./deploy/install.sh`.
+Before upgrading, `target/release/sprite check /var/lib/sprite/library` confirms every stored sprite
+still passes the new binary's spec limits (it lists any that don't, and exits non-zero).
 
 ## 3. Install the service
 ```bash
@@ -35,7 +37,8 @@ This creates the `sprite` system user, `/etc/sprite/{sprite.env,tokens}` and `/v
 
 Edit `/etc/sprite/sprite.env` if your hostname isn't `sprites.asleepace.com`, then `sudo systemctl restart sprite`.
 
-Upgrading an older install? The installer never overwrites `sprite.env`, so add
+Upgrading an older install? Add a scope to each line of `/etc/sprite/tokens` (see [Tokens](#tokens)):
+`write` for you, `read` for prototypes. The installer never overwrites `sprite.env`, so add
 `SPRITE_PUBLIC_URL=https://sprites.asleepace.com` yourself if you want `export_gif` to include download links.
 
 ## 4. nginx + TLS
@@ -89,17 +92,29 @@ For a prototype served from a dev origin that reads pixels (canvas), add that or
 | `GET /v1/sprites/{name}.gif` | animated, timed from the spec's `ms`/`hold`; `?scale=` (default 4), `?bg=transparent\|rrggbb`, `?loop=forward\|pingpong`, `?repeat=N` |
 | `GET /v1/sprites/{name}.sheet.png` | all frames in a row |
 | `GET /v1/sprites/{name}.json` | the spec |
-| `GET /v1/atlas.png`, `/v1/atlas.json` | `?category=`, `?names=a,b`, `?scale=1..8` |
+| `GET /v1/atlas.png`, `/v1/atlas.json` | `?category=`, `?names=a,b`, `?scale=1..8`, `?max=` (largest side in px, default 4096, up to 8192). `413` if the selection doesn't fit; filter it or lower the scale. Identical frames share a cell, so look frames up by key |
 | `POST /v1/render?format=png\|gif\|sheet\|json` | render a spec without saving (256 KB limit) |
 
 Everything returns an `ETag`; send `If-None-Match` to get `304` when nothing changed.
-Writes only happen through MCP (`create_sprite`, `edit_sprite`, `delete_sprite`).
+Writes only happen through MCP (`create_sprite`, `edit_sprite`, `delete_sprite`, `restore_sprite`).
 
 ## Tokens
-`/etc/sprite/tokens` holds one `label:token` per line. Give each person or prototype its own
+`/etc/sprite/tokens` holds one `label:scope:token` per line. Give each person or prototype its own
 (`openssl rand -hex 32`), and delete a line to revoke it, then `systemctl restart sprite`.
-Treat `?key=` tokens as low-trust (they end up in browser history and bundles); give
-prototypes their own token so you can rotate it without touching anyone else's.
+
+| scope | can use |
+|---|---|
+| `read` | the REST API (`GET /v1/…`, `POST /v1/render`), by header or `?key=` |
+| `write` | everything `read` can, plus MCP (create, edit, delete, restore) — header only |
+
+```
+colin:write:3f9c…
+racecar-proto:read:a71e…
+```
+Give prototypes `read` tokens: `?key=` tokens end up in browser history and bundles, so MCP never
+accepts a token from the query string, and a leaked read token can't change the library.
+Entries written as `label:token` (from before scopes) still work as `write`; the server prints a
+warning at startup until you add a scope.
 
 ## Blind review on the server
 Set `ANTHROPIC_API_KEY` in `/etc/sprite/sprite.env` (with a spend limit on the key) and every
@@ -112,4 +127,6 @@ journalctl -u sprite -f                 # logs
 sudo systemctl restart sprite           # after editing env or tokens
 sudo tar czf sprites-$(date +%F).tgz -C /var/lib/sprite library   # back up the library
 ```
-The library is plain JSON, so it's also easy to keep in git.
+The library is plain JSON, so it's also easy to keep in git. Every save is also kept under
+`_history/NAME/` (one file per revision, plus `log.jsonl` with who and when), and deleted sprites
+move to `_trash/`, so `sprite_history` / `restore_sprite` can undo any change, including a delete.

@@ -46,29 +46,58 @@ type RenderCache = Arc<Mutex<HashMap<String, (u64, Arc<Rendered>)>>>;
 #[derive(Clone)]
 struct AppState {
     lib: Arc<PathBuf>,
-    tokens: Arc<Vec<(String, String)>>, // (label, token)
+    tokens: Arc<Vec<Token>>,
     cache: RenderCache,
 }
 
 // ───────────────────────── tokens ─────────────────────────
 
-/// Tokens come from SPRITE_TOKENS (comma-separated) and/or a file with one `label:token` or
-/// `token` per line (`#` comments). Tokens shorter than 24 characters are rejected.
-fn load_tokens(file: Option<&PathBuf>) -> Result<Vec<(String, String)>> {
-    let mut out = Vec::new();
+/// What a token may do. `Read` covers the REST API (GET + ad-hoc render); `Write` also covers
+/// MCP, which is where sprites get created, edited and deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    Read,
+    Write,
+}
+
+#[derive(Debug, Clone)]
+struct Token {
+    label: String,
+    scope: Scope,
+    /// false for `label:token` entries, which default to write
+    explicit: bool,
+    secret: String,
+}
+
+/// Tokens come from SPRITE_TOKENS (comma-separated) and/or a file with one entry per line
+/// (`#` comments). An entry is `label:scope:token`, `label:token` or a bare `token`, where scope
+/// is `read` or `write`. Entries without a scope are `write`, which is what every token could do
+/// before scopes existed. Tokens shorter than 24 characters are rejected.
+fn load_tokens(file: Option<&PathBuf>) -> Result<Vec<Token>> {
+    let mut out: Vec<Token> = Vec::new();
     let mut add = |line: &str, src: &str| -> Result<()> {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             return Ok(());
         }
-        let (label, tok) = match line.split_once(':') {
-            Some((l, t)) => (l.trim().to_string(), t.trim().to_string()),
-            None => (format!("{src}#{}", out.len() + 1), line.to_string()),
+        let parts: Vec<&str> = line.split(':').map(str::trim).collect();
+        let (label, scope, secret) = match parts[..] {
+            [t] => (format!("{src}#{}", out.len() + 1), None, t),
+            [l, t] => (l.to_string(), None, t),
+            [l, s, t] => {
+                let scope = match s {
+                    "read" => Scope::Read,
+                    "write" => Scope::Write,
+                    other => bail!("token {l:?}: scope must be read or write, not {other:?}"),
+                };
+                (l.to_string(), Some(scope), t)
+            }
+            _ => bail!("token entries look like label:scope:token (got {} fields)", parts.len()),
         };
-        if tok.len() < 24 {
+        if secret.len() < 24 {
             bail!("token for {label:?} is too short (need ≥ 24 chars; try `openssl rand -hex 32`)");
         }
-        out.push((label, tok));
+        out.push(Token { label, scope: scope.unwrap_or(Scope::Write), explicit: scope.is_some(), secret: secret.to_string() });
         Ok(())
     };
     if let Ok(env) = std::env::var("SPRITE_TOKENS") {
@@ -92,8 +121,14 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// The token label behind a request, for handlers that want to log who did what.
+#[derive(Debug, Clone)]
+pub(crate) struct Caller(pub String);
+
 /// Bearer header, or `?key=` for places that can't set headers (<img src>, Phaser loaders).
-async fn auth(State(st): State<AppState>, req: Request, next: Next) -> Response {
+/// MCP needs a write-scoped token sent as a header: `?key=` tokens end up in URLs, bundles and
+/// browser history, so they never authorize changes.
+async fn auth(State(st): State<AppState>, mut req: Request, next: Next) -> Response {
     if req.uri().path() == "/healthz" || req.method() == Method::OPTIONS {
         return next.run(req).await;
     }
@@ -103,15 +138,28 @@ async fn auth(State(st): State<AppState>, req: Request, next: Next) -> Response 
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::to_string);
+    let via_header = from_header.is_some();
     let from_query = req.uri().query().and_then(|q| {
         q.split('&').find_map(|kv| kv.strip_prefix("key=").map(|v| v.to_string()))
     });
     let presented = from_header.or(from_query);
-    let ok = presented.as_deref().is_some_and(|p| st.tokens.iter().any(|(_, t)| ct_eq(t.as_bytes(), p.as_bytes())));
-    if !ok {
+    let Some(tok) = presented.as_deref().and_then(|p| st.tokens.iter().find(|t| ct_eq(t.secret.as_bytes(), p.as_bytes()))) else {
         return (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, "Bearer")], Json(json!({"error": "missing or invalid token"})))
             .into_response();
+    };
+    if req.uri().path().starts_with("/mcp") {
+        let why = if tok.scope != Scope::Write {
+            Some("this token is read-only; MCP needs a write token")
+        } else if !via_header {
+            Some("MCP needs the token in an Authorization: Bearer header, not ?key=")
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            return (StatusCode::FORBIDDEN, Json(json!({"error": why}))).into_response();
+        }
     }
+    req.extensions_mut().insert(Caller(tok.label.clone()));
     next.run(req).await
 }
 
@@ -342,10 +390,13 @@ async fn atlas(
         _ => return Err(ApiError(StatusCode::NOT_FOUND, json!({"error": "use /v1/atlas.png or /v1/atlas.json"}))),
     };
     let scale = qnum(&q, "scale", 1, 1, 8);
+    let max_side = qnum(&q, "max", library::ATLAS_MAX_SIDE, 256, library::ATLAS_SIDE_LIMIT);
     let category = q.get("category").cloned();
     let names: Option<Vec<String>> = q.get("names").map(|s| s.split(',').map(|x| x.trim().to_string()).collect());
-    // the JSON points at the matching PNG, keeping the same filters (and key, if one was used)
-    let qs: Vec<String> = q.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    // the JSON points at the matching PNG with the same filters. Never echo the token: atlas.json
+    // gets saved next to game code and committed.
+    let mut qs: Vec<String> = q.iter().filter(|(k, _)| k.as_str() != "key").map(|(k, v)| format!("{k}={v}")).collect();
+    qs.sort();
     let image_ref = if qs.is_empty() { "atlas.png".to_string() } else { format!("atlas.png?{}", qs.join("&")) };
     let res = tokio::task::spawn_blocking(move || -> Result<Response, ApiError> {
         let mut picked = Vec::new();
@@ -369,8 +420,8 @@ async fn atlas(
         if headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) == Some(tag.as_str()) {
             return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, tag)]).into_response());
         }
-        let (img, meta) = library::atlas(&picked, scale, &image_ref)
-            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})))?;
+        let (img, meta) = library::atlas(&picked, scale, &image_ref, max_side)
+            .map_err(|e| ApiError(StatusCode::PAYLOAD_TOO_LARGE, json!({"error": e.to_string()})))?;
         if as_png {
             let png = img.png().map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})))?;
             Ok(cached(&headers, &tag, "image/png", png))
@@ -423,6 +474,14 @@ pub fn serve(o: ServeOpts) -> Result<()> {
     let tokens = load_tokens(o.tokens_file.as_ref())?;
     if tokens.is_empty() {
         bail!("no tokens configured: set SPRITE_TOKENS or --tokens-file (generate one with `openssl rand -hex 32`)");
+    }
+    let unscoped: Vec<&str> = tokens.iter().filter(|t| !t.explicit).map(|t| t.label.as_str()).collect();
+    if !unscoped.is_empty() {
+        eprintln!(
+            "sprite serve: token(s) {} have no scope and can write via MCP; write them as label:read:token \
+             (prototypes, ?key= use) or label:write:token",
+            unscoped.join(", ")
+        );
     }
     std::fs::create_dir_all(&o.library).with_context(|| format!("create library {}", o.library.display()))?;
     let state = AppState { lib: Arc::new(o.library.clone()), tokens: Arc::new(tokens), cache: Arc::default() };

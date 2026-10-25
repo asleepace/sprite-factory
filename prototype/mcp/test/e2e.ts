@@ -56,10 +56,10 @@ const step = (s: string) => console.log(`\n▶ ${s}`);
 step("tools/list");
 const tools = (await client.listTools()).tools.map((t) => t.name);
 console.log(tools.join(", "));
-assert.deepEqual(
-  [...tools].sort(),
-  ["blind_review", "create_sprite", "delete_sprite", "edit_sprite", "export_atlas", "get_sprite", "list_sprites", "render_sprite", "style_guide"],
-);
+// the core tools both servers share; the Rust server adds more (export_gif, sprite_history, restore_sprite)
+for (const t of ["blind_review", "create_sprite", "delete_sprite", "edit_sprite", "export_atlas", "get_sprite", "list_sprites", "render_sprite", "style_guide"]) {
+  assert.ok(tools.includes(t), `missing tool ${t}`);
+}
 
 step("style_guide");
 const guide = await call("style_guide");

@@ -5,6 +5,7 @@ mod http;
 mod imgio;
 mod library;
 mod mcp;
+mod store;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
@@ -76,6 +77,9 @@ enum Cmd {
         out: PathBuf,
         #[arg(long, default_value_t = 1)]
         scale: usize,
+        /// refuse atlases wider or taller than this (px); GPUs reliably load 4096
+        #[arg(long, default_value_t = library::ATLAS_MAX_SIDE)]
+        max_side: usize,
     },
     /// Print the palette as JSON, or write a swatch image with --out
     Palette {
@@ -96,6 +100,8 @@ enum Cmd {
         #[arg(long)]
         diff: Option<PathBuf>,
     },
+    /// Validate specs without rendering them (e.g. a live library before upgrading the server)
+    Check { files: Vec<PathBuf> },
     /// Time rendering every frame of every spec
     Bench {
         files: Vec<PathBuf>,
@@ -201,12 +207,12 @@ fn main() -> Result<()> {
             imgio::write(&out, &imgio::strip_sheet(&rows, scale).png()?)?;
             println!("strips {} → {}", rows.len(), out.display());
         }
-        Cmd::Atlas { files, out, scale } => {
+        Cmd::Atlas { files, out, scale, max_side } => {
             let specs = filtered(&files, &[])?;
             let rendered = render_all(&specs, &pal, &opts)?;
             let png_path = out.with_extension("png");
             let name = png_path.file_name().unwrap().to_string_lossy().to_string();
-            let (img, meta) = library::atlas(&rendered, scale.max(1), &name)?;
+            let (img, meta) = library::atlas(&rendered, scale.max(1), &name, max_side.min(library::ATLAS_SIDE_LIMIT))?;
             imgio::write(&png_path, &img.png()?)?;
             imgio::write(&out.with_extension("json"), serde_json::to_string_pretty(&meta)?.as_bytes())?;
             println!("atlas {}×{} ({} sprites) → {}", img.w, img.h, rendered.len(), png_path.display());
@@ -305,6 +311,39 @@ fn main() -> Result<()> {
             }
             if mean > max_mean {
                 bail!("mean mismatch {mean:.2}% exceeds {max_mean}%");
+            }
+        }
+        Cmd::Check { files } => {
+            let (mut ok, mut bad) = (0usize, Vec::new());
+            for f in &files {
+                // a library folder or a folder of batch files: check each file on its own, so one
+                // unreadable file is reported instead of stopping the check
+                let mut paths: Vec<PathBuf> = if f.is_dir() {
+                    std::fs::read_dir(f)?.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "json")).collect()
+                } else {
+                    vec![f.clone()]
+                };
+                paths.sort();
+                let mut specs = Vec::new();
+                for p in paths {
+                    match library::load_specs(std::slice::from_ref(&p)) {
+                        Ok(v) => specs.extend(v),
+                        Err(e) => bad.push(format!("{}: {e:#}", p.display())),
+                    }
+                }
+                for v in specs {
+                    match Spec::from_json(&v, &pal) {
+                        Ok(_) => ok += 1,
+                        Err(e) => bad.push(format!("{}: {}", library::spec_name(&v), e.join("; "))),
+                    }
+                }
+            }
+            println!("{ok} valid, {} invalid", bad.len());
+            for b in &bad {
+                println!("  {b}");
+            }
+            if !bad.is_empty() {
+                std::process::exit(1);
             }
         }
         Cmd::Bench { files, repeat } => {

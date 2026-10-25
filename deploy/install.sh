@@ -19,7 +19,7 @@ fi
 
 if [[ ! -s /etc/sprite/tokens ]]; then
   TOKEN=$(openssl rand -hex 32)
-  printf '# label:token — one per person or prototype; remove a line to revoke\ncolin:%s\n' "$TOKEN" > /etc/sprite/tokens
+  printf '# label:scope:token — scope is read (REST only; use for prototypes and ?key=) or write (MCP too)\n# one per person or prototype; remove a line to revoke\ncolin:write:%s\n' "$TOKEN" > /etc/sprite/tokens
   chown root:sprite /etc/sprite/tokens && chmod 0640 /etc/sprite/tokens
   echo "→ created token for 'colin' (shown once):"
   echo "   $TOKEN"

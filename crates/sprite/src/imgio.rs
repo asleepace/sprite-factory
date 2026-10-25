@@ -181,10 +181,18 @@ pub fn gif(frames: &[Frame], durations: &[u32], o: &GifOpts) -> Result<(Vec<u8>,
 ///
 /// Sprites only ever use the renderer's fixed colours, so the GIF gets one global palette built
 /// from them: no quantization, no dithering, identical colours in every frame. Index 0 is the
-/// transparent (or background) colour. Identical consecutive frames are merged into one longer
-/// frame, and delays are rounded on the running total so a loop keeps its exact length. Frames
-/// stream straight into the encoder with a one-frame lookahead, so memory stays at two indexed
-/// frames however long the loop is.
+/// transparent (or background) colour.
+///
+/// Identical consecutive frames are merged into one longer frame, and when the loop wraps from a
+/// last frame that looks like the first, that frame is folded into the first too. Delays are
+/// rounded on the running total so a loop keeps its exact length.
+///
+/// After the first frame, each frame only covers the rectangle that changed, with unchanged
+/// pixels written as a transparent "keep" index (frames stack with `Keep` disposal). A GIF can't
+/// draw transparency over an opaque pixel, so on a transparent background a frame whose
+/// successor clears pixels grows its rectangle over them and uses `Background` disposal to erase
+/// it. Frames are compared at 1× and re-indexed on the second pass, so memory stays at a few 1×
+/// frames plus one upscaled rectangle however long the loop is.
 pub fn encode_gif(frames: &[&[u8]], side: usize, durations: &[u32], o: &GifOpts) -> Result<(Vec<u8>, GifInfo)> {
     anyhow::ensure!(!frames.is_empty(), "no frames to encode");
     let scale = o.scale.max(1);
@@ -194,48 +202,105 @@ pub fn encode_gif(frames: &[&[u8]], side: usize, durations: &[u32], o: &GifOpts)
         anyhow::bail!("frame {i} is not {side}×{side} RGBA");
     }
 
-    // ── palette: [bg/transparent] + every colour the renderer can emit, padded to 256
+    // ── palette: [bg/transparent] + every colour the renderer can emit [+ keep], padded to 256
     let colours = sprite_core::Palette::new().output_colors();
+    anyhow::ensure!(colours.len() + 2 <= 256, "{} renderer colours don't fit a GIF palette", colours.len());
     let flat: Vec<u8> = std::iter::once(o.bg.unwrap_or([0, 0, 0])).chain(colours.iter().copied()).flatten().chain(std::iter::repeat(0)).take(768).collect();
+    // on a transparent GIF "unchanged" is index 0 itself; on a background it needs a spare index
+    let keep = if o.bg.is_none() { 0 } else { colours.len() as u8 + 1 };
     let mut index = Indexer::new(&colours);
 
-    // ── play order
+    // ── play order, merged into runs of identical frames: (source frame, ms)
     let n = frames.len();
     let mut order: Vec<usize> = (0..n).collect();
     if o.pingpong && n > 2 {
         order.extend((1..n - 1).rev());
     }
+    let looping = o.repeat != Some(1);
+    let px = side * side;
+    let (mut first, mut last, mut cur) = (vec![0u8; px], vec![0u8; px], vec![0u8; px]);
+    let mut runs: Vec<(usize, u64)> = Vec::new();
+    for &i in &order {
+        index.frame(frames[i], side, &mut cur);
+        let ms = durations.get(i).copied().unwrap_or(110) as u64;
+        match runs.last_mut() {
+            Some(r) if cur == last => r.1 += ms,
+            _ => {
+                if runs.is_empty() {
+                    first.copy_from_slice(&cur);
+                }
+                runs.push((i, ms));
+                std::mem::swap(&mut last, &mut cur);
+            }
+        }
+    }
+    // the loop wraps from the last frame straight into the first: same picture, one frame
+    if looping && runs.len() > 1 && last == first {
+        let (_, ms) = runs.pop().unwrap();
+        runs[0].1 += ms;
+    }
 
     let mut out = Vec::new();
-    let mut w = FrameWriter { side: out_side as u16, transparent: o.bg.is_none().then_some(0), total_ms: 0, t_cs: 0, written: 0 };
+    let mut w = FrameWriter { transparent: Some(keep), keep, total_ms: 0, t_cs: 0, written: 0 };
     {
-        let mut enc = gif::Encoder::new(&mut out, w.side, w.side, &flat)?;
+        let mut enc = gif::Encoder::new(&mut out, out_side as u16, out_side as u16, &flat)?;
         // The loop extension counts *re*plays and 0 means forever, so "play once" omits it entirely.
         match o.repeat {
             None => enc.set_repeat(gif::Repeat::Infinite)?,
             Some(k) if k > 1 => enc.set_repeat(gif::Repeat::Finite(k - 1))?,
             Some(_) => {}
         }
-        // index each frame (upscaled) into `cur`; merge it into `pending` if identical, else flush
-        let mut pending = vec![0u8; out_side * out_side];
-        let mut cur = vec![0u8; out_side * out_side];
-        let mut pending_ms: Option<u64> = None;
-        for &i in &order {
-            index.frame(frames[i], side, scale, &mut cur);
-            let ms = durations.get(i).copied().unwrap_or(110) as u64;
-            match pending_ms.as_mut() {
-                Some(d) if pending == cur => *d += ms,
-                _ => {
-                    if let Some(d) = pending_ms {
-                        w.write(&mut enc, &pending, d)?;
-                    }
-                    std::mem::swap(&mut pending, &mut cur);
-                    pending_ms = Some(ms);
+        // `shown` is the 1× canvas before a frame is drawn (0 = cleared); `now` is the frame
+        let (mut shown, mut now, mut next) = (vec![0u8; px], first.clone(), vec![0u8; px]);
+        let mut rect_px = Vec::new();
+        for k in 0..runs.len() {
+            let has_next = if k + 1 < runs.len() {
+                index.frame(frames[runs[k + 1].0], side, &mut next);
+                true
+            } else {
+                next.copy_from_slice(&first);
+                looping
+            };
+            // bounding box of what changes, plus (transparent GIFs) what the next frame clears
+            let (mut x0, mut y0, mut x1, mut y1, mut erase) = (side, side, 0, 0, false);
+            for p in 0..px {
+                let clears = o.bg.is_none() && has_next && now[p] != 0 && next[p] == 0;
+                if k == 0 || now[p] != shown[p] || clears {
+                    erase |= clears;
+                    let (x, y) = (p % side, p / side);
+                    (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x + 1), y1.max(y + 1));
                 }
             }
-        }
-        if let Some(d) = pending_ms {
-            w.write(&mut enc, &pending, d)?;
+            if x0 >= x1 {
+                // nothing to draw (a frame that only differs from one erased beneath it): 1 pixel
+                (x0, y0, x1, y1) = (0, 0, 1, 1);
+            }
+            let (rw, rh) = (x1 - x0, y1 - y0);
+            rect_px.clear();
+            rect_px.resize(rw * rh * scale * scale, 0);
+            for y in y0..y1 {
+                let row0 = (y - y0) * scale * rw * scale;
+                for x in x0..x1 {
+                    let p = y * side + x;
+                    debug_assert!(k == 0 || o.bg.is_some() || now[p] != 0 || shown[p] == 0, "transparent over opaque at {p}");
+                    let v = if k > 0 && now[p] == shown[p] { keep } else { now[p] };
+                    rect_px[row0 + (x - x0) * scale..row0 + (x - x0 + 1) * scale].fill(v);
+                }
+                for yy in 1..scale {
+                    rect_px.copy_within(row0..row0 + rw * scale, row0 + yy * rw * scale);
+                }
+            }
+            let area = [x0 * scale, y0 * scale, rw * scale, rh * scale].map(|v| v as u16);
+            let dispose = if erase { gif::DisposalMethod::Background } else { gif::DisposalMethod::Keep };
+            w.write(&mut enc, area, &rect_px, runs[k].1, dispose)?;
+
+            shown.copy_from_slice(&now);
+            if erase {
+                for y in y0..y1 {
+                    shown[y * side + x0..y * side + x1].fill(0);
+                }
+            }
+            std::mem::swap(&mut now, &mut next);
         }
     }
     Ok((out, GifInfo { side: out_side, frames: w.written, loop_ms: w.total_ms }))
@@ -273,54 +338,54 @@ impl<'a> Indexer<'a> {
         v
     }
 
-    /// Index one `side`×`side` RGBA frame into `out`, upscaled `scale`× (nearest neighbour).
-    fn frame(&mut self, src: &[u8], side: usize, scale: usize, out: &mut [u8]) {
-        let out_side = side * scale;
-        for y in 0..side {
-            let row0 = y * scale * out_side;
-            for x in 0..side {
-                let p = &src[(y * side + x) * 4..(y * side + x) * 4 + 4];
-                let v = if p[3] == 0 { 0 } else { self.index([p[0], p[1], p[2]]) };
-                out[row0 + x * scale..row0 + (x + 1) * scale].fill(v);
-            }
-            // the other rows of this sprite row are copies of the first
-            for yy in 1..scale {
-                out.copy_within(row0..row0 + out_side, row0 + yy * out_side);
-            }
+    /// Index one `side`×`side` RGBA frame into `out` (0 = transparent).
+    fn frame(&mut self, src: &[u8], side: usize, out: &mut [u8]) {
+        for (p, v) in out.iter_mut().enumerate().take(side * side) {
+            let c = &src[p * 4..p * 4 + 4];
+            *v = if c[3] == 0 { 0 } else { self.index([c[0], c[1], c[2]]) };
         }
     }
 }
 
 /// Writes frames with delays rounded on the running total. GIF delays are u16 centiseconds, so a
-/// frame longer than 655.35 s is written as several identical frames.
+/// frame longer than 655.35 s is written as the frame plus "keep" frames over the same rectangle;
+/// only the last of them carries the real disposal.
 struct FrameWriter {
-    side: u16,
     transparent: Option<u8>,
+    keep: u8,
     total_ms: u64,
     t_cs: u64,
     written: usize,
 }
 
 impl FrameWriter {
-    fn write<W: std::io::Write>(&mut self, enc: &mut gif::Encoder<W>, idx: &[u8], ms: u64) -> Result<()> {
+    fn write<W: std::io::Write>(&mut self, enc: &mut gif::Encoder<W>, [left, top, width, height]: [u16; 4], idx: &[u8], ms: u64, dispose: gif::DisposalMethod) -> Result<()> {
         self.total_ms += ms;
         let end_cs = (self.total_ms + 5) / 10;
         let mut delay = end_cs.saturating_sub(self.t_cs).max(2); // browsers turn delays < 2cs into 10cs
         self.t_cs += delay;
+        let mut hold: Option<Vec<u8>> = None;
         while delay > 0 {
             let d = delay.min(u16::MAX as u64);
             delay -= d;
+            let buffer = match &hold {
+                None => std::borrow::Cow::Borrowed(idx),
+                Some(h) => std::borrow::Cow::Borrowed(h.as_slice()),
+            };
             let fr = gif::Frame {
-                width: self.side,
-                height: self.side,
+                left,
+                top,
+                width,
+                height,
                 delay: d as u16,
-                dispose: gif::DisposalMethod::Background,
+                dispose: if delay == 0 { dispose } else { gif::DisposalMethod::Keep },
                 transparent: self.transparent,
-                buffer: std::borrow::Cow::Borrowed(idx),
+                buffer,
                 ..gif::Frame::default()
             };
             enc.write_frame(&fr)?;
             self.written += 1;
+            hold.get_or_insert_with(|| vec![self.keep; idx.len()]);
         }
         Ok(())
     }
@@ -455,7 +520,9 @@ mod tests {
         let (s, f) = sprite(serde_json::json!({"name": "b", "prims": [{"t": "ellipse", "c": [16, 16], "r": 10, "m": "red"}]}));
         let o = GifOpts { scale: 2, bg: Some([246, 245, 240]), ..Default::default() };
         let d = decode(&gif(&f, &durations(&s, f.len()), &o).unwrap().0);
-        assert!(d.transparent.iter().all(|t| t.is_none()));
+        let keep = Palette::new().output_colors().len() as u8 + 1;
+        assert!(d.transparent.iter().all(|t| *t == Some(keep)), "only the spare keep index is transparent");
+        assert_eq!(d.first[0], 0, "corner is the background index");
         assert_eq!(d.side, 64);
     }
 
@@ -514,6 +581,121 @@ mod tests {
                 assert_eq!(d.first[y * 96 + x] != 0, src_opaque, "pixel ({x},{y})");
             }
         }
+    }
+
+    /// Play a GIF the way a browser does (frame rectangles, transparent index, disposal) for
+    /// `loops` passes and return the picture after each frame: None = transparent.
+    fn play(bytes: &[u8], loops: usize) -> Vec<Vec<Option<u8>>> {
+        let mut shown = Vec::new();
+        let mut canvas: Vec<Option<u8>> = vec![];
+        for _ in 0..loops {
+            let mut opts = gif::DecodeOptions::new();
+            opts.set_color_output(gif::ColorOutput::Indexed);
+            let mut d = opts.read_info(bytes).unwrap();
+            let w = d.width() as usize;
+            canvas.resize(w * d.height() as usize, None);
+            while let Some(f) = d.read_next_frame().unwrap() {
+                let (l, t, fw) = (f.left as usize, f.top as usize, f.width as usize);
+                for (i, &v) in f.buffer.iter().enumerate() {
+                    if Some(v) != f.transparent {
+                        canvas[(t + i / fw) * w + l + i % fw] = Some(v);
+                    }
+                }
+                shown.push(canvas.clone());
+                if f.dispose == gif::DisposalMethod::Background {
+                    for i in 0..f.buffer.len() {
+                        canvas[(t + i / fw) * w + l + i % fw] = None;
+                    }
+                }
+            }
+        }
+        shown.dedup(); // split long frames repeat the same picture
+        shown
+    }
+
+    /// What `play` should show: each distinct picture in play order (identical neighbours, and a
+    /// last frame equal to the first when looping, collapse), upscaled, for `loops` passes.
+    fn expected(f: &[Frame], o: &GifOpts, loops: usize) -> Vec<Vec<Option<u8>>> {
+        let colours = Palette::new().output_colors();
+        let mut ix = Indexer::new(&colours);
+        let mut order: Vec<usize> = (0..f.len()).collect();
+        if o.pingpong && f.len() > 2 {
+            order.extend((1..f.len() - 1).rev());
+        }
+        order.dedup_by_key(|i| f[*i].0.clone());
+        if o.repeat != Some(1) && order.len() > 1 && f[order[0]].0 == f[*order.last().unwrap()].0 {
+            order.pop();
+        }
+        let (s, side) = (o.scale, SIZE * o.scale);
+        let pics: Vec<Vec<Option<u8>>> = order
+            .iter()
+            .map(|&i| {
+                (0..side * side)
+                    .map(|p| {
+                        let q = ((p / side) / s * SIZE + (p % side) / s) * 4;
+                        let c = &f[i].0[q..q + 4];
+                        if c[3] == 0 { o.bg.map(|_| 0) } else { Some(ix.index([c[0], c[1], c[2]])) }
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut all: Vec<_> = (0..loops).flat_map(|_| pics.iter().cloned()).collect();
+        all.dedup();
+        all
+    }
+
+    #[test]
+    fn delta_frames_replay_exactly_over_two_loops() {
+        let star = serde_json::json!({"name": "b", "anim": "spin", "prims": [{"t": "star", "c": [16, 16], "r": 12, "m": "gold"}]});
+        let bob = serde_json::json!({"name": "b", "anim": "bob", "prims": [{"t": "ellipse", "c": [16, 14], "r": 7, "m": "red"}, {"t": "rect", "p": [10, 24, 22, 28], "m": "teal"}]});
+        let blink = serde_json::json!({"name": "b", "frames": 4, "prims": [{"t": "ellipse", "c": [16, 16], "r": 10, "m": "red"}],
+            "tracks": [{"prop": "sx", "amp": -1, "wave": "square"}]});
+        for spec in [star, bob, blink] {
+            let (s, f) = sprite(spec.clone());
+            let dur = durations(&s, f.len());
+            for o in [
+                GifOpts::default(),
+                GifOpts { scale: 3, bg: Some([246, 245, 240]), ..Default::default() },
+                GifOpts { pingpong: true, scale: 2, ..Default::default() },
+                GifOpts { repeat: Some(1), scale: 1, ..Default::default() },
+            ] {
+                let (bytes, _) = gif(&f, &dur, &o).unwrap();
+                let loops = if o.repeat == Some(1) { 1 } else { 2 }; // play-once never wraps
+                assert!(play(&bytes, loops) == expected(&f, &o, loops), "{spec} with {o:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn later_frames_only_cover_what_changed() {
+        // only the hand moves: frames after the first are a small rectangle, not the canvas
+        let (s, f) = sprite(serde_json::json!({"name": "b", "frames": 4, "prims": [{"t": "rect", "p": [4, 4, 28, 28], "m": "teal"},
+            {"t": "ellipse", "c": [24, 8], "r": 2, "m": "red", "g": "hand"}], "tracks": [{"g": "hand", "prop": "dy", "amp": 2}]}));
+        let (bytes, _) = gif(&f, &durations(&s, f.len()), &GifOpts { scale: 8, ..Default::default() }).unwrap();
+        let mut d = gif::DecodeOptions::new().read_info(bytes.as_slice()).unwrap();
+        let mut areas = vec![];
+        while let Some(fr) = d.read_next_frame().unwrap() {
+            areas.push(fr.width as usize * fr.height as usize);
+        }
+        assert_eq!(areas[0], 256 * 256);
+        assert!(areas[1..].iter().all(|&a| a <= 64 * 64), "{areas:?}");
+    }
+
+    #[test]
+    fn a_last_frame_matching_the_first_folds_into_it() {
+        // square wave shifted a quarter loop: A A B B B B A A, which loops as A(4) B(4)
+        let (s, f) = sprite(serde_json::json!({"name": "b", "snap": true, "ms": 100, "prims": [{"t": "ellipse", "c": [16, 16], "r": 10, "m": "red"}],
+            "tracks": [{"prop": "dy", "amp": 1, "wave": "square", "phase": 0.75}]}));
+        assert_eq!(f.len(), 8);
+        assert!(f[0].0 == f[7].0 && f[0].0 != f[3].0);
+        let dur = durations(&s, f.len());
+        let (bytes, info) = gif(&f, &dur, &GifOpts::default()).unwrap();
+        assert_eq!((info.frames, info.loop_ms), (2, 800));
+        assert_eq!(decode(&bytes).delays, vec![40, 40]);
+        // played once there is no wrap, so the last frames stay
+        let (once, info) = gif(&f, &dur, &GifOpts { repeat: Some(1), ..Default::default() }).unwrap();
+        assert_eq!(info.frames, 3);
+        assert_eq!(decode(&once).delays, vec![20, 40, 20]);
     }
 
     #[test]

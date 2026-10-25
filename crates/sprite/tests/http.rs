@@ -11,6 +11,7 @@ use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 
 const TOKEN: &str = "test-token-0123456789abcdef0123456789";
+const READ_TOKEN: &str = "read-token-0123456789abcdef0123456789";
 
 struct Server {
     child: Child,
@@ -39,7 +40,7 @@ fn start() -> Server {
     let mut child = Command::new(env!("CARGO_BIN_EXE_sprite"))
         .args(["serve", "--bind", "127.0.0.1:0", "--library"])
         .arg(&lib)
-        .env("SPRITE_TOKENS", format!("tester:{TOKEN}"))
+        .env("SPRITE_TOKENS", format!("tester:{TOKEN},proto:read:{READ_TOKEN}"))
         .env_remove("ANTHROPIC_API_KEY")
         .stdout(Stdio::piped())
         .spawn()
@@ -145,7 +146,17 @@ fn rest_auth_and_assets() {
     assert_eq!(st, 200);
     let atlas: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(atlas["meta"]["image"], "atlas.png?scale=2");
-    assert_eq!(atlas["frames"]["apple_3"]["frame"]["x"], 3 * 64);
+    // the token never ends up inside atlas.json
+    let (_, _, body) = req(&s.addr, "GET", &format!("/v1/atlas.json?scale=2&key={TOKEN}"), &[], b"");
+    let keyed: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(keyed["meta"]["image"], "atlas.png?scale=2");
+    assert_eq!(req(&s.addr, "GET", "/v1/atlas.png?scale=8&max=256", &[AUTH], b"").0, 413);
+    // every frame key resolves to a 64px cell inside the image (identical bob poses may share one)
+    let (w, h) = (atlas["meta"]["size"]["w"].as_u64().unwrap(), atlas["meta"]["size"]["h"].as_u64().unwrap());
+    for k in 0..8 {
+        let f = &atlas["frames"][format!("apple_{k}")]["frame"];
+        assert!(f["x"].as_u64().unwrap() + 64 <= w && f["y"].as_u64().unwrap() + 64 <= h && f["w"] == 64, "{f}");
+    }
     assert_eq!(req(&s.addr, "GET", "/v1/atlas.png", &[AUTH], b"").0, 200);
 
     // ad-hoc render: errors are specific, success returns an image, nothing is saved
@@ -165,6 +176,17 @@ async fn mcp_over_http_shares_the_library() {
     let s = start();
     let url = format!("http://{}/mcp", s.addr);
 
+    // read tokens are for REST only, and ?key= never authorizes MCP
+    let init = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#;
+    let mcp_hdrs = [("Content-Type", "application/json"), ("Accept", "application/json, text/event-stream")];
+    let read_auth = format!("Bearer {READ_TOKEN}");
+    let (st, _, body) = req(&s.addr, "POST", "/mcp", &[mcp_hdrs[0], mcp_hdrs[1], ("Authorization", &read_auth)], init);
+    assert_eq!(st, 403, "{}", String::from_utf8_lossy(&body));
+    assert!(String::from_utf8_lossy(&body).contains("read-only"));
+    let (st, _, _) = req(&s.addr, "POST", &format!("/mcp?key={TOKEN}"), &mcp_hdrs, init);
+    assert_eq!(st, 403);
+    assert_eq!(req(&s.addr, "GET", &format!("/v1/sprites/apple.png?key={READ_TOKEN}"), &[], b"").0, 200);
+
     // no token → the transport can't even initialise
     let anon = ().serve(StreamableHttpClientTransport::from_config(StreamableHttpClientTransportConfig::with_uri(url.clone()))).await;
     assert!(anon.is_err(), "unauthenticated MCP must be refused");
@@ -172,7 +194,7 @@ async fn mcp_over_http_shares_the_library() {
     let cfg = StreamableHttpClientTransportConfig::with_uri(url).auth_header(TOKEN);
     let client = ().serve(StreamableHttpClientTransport::from_config(cfg)).await.expect("connect with token");
     let tools = client.list_all_tools().await.unwrap();
-    assert_eq!(tools.len(), 10);
+    assert_eq!(tools.len(), 12);
 
     let mut p = CallToolRequestParams::new("create_sprite");
     p.arguments = json!({"name": "moon", "category": "nature", "prims": [{"t":"arc","c":[16,16],"r":12,"a0":-90,"a1":90,"m":"yellow"}]})
@@ -181,6 +203,12 @@ async fn mcp_over_http_shares_the_library() {
     let r = client.call_tool(p).await.unwrap();
     assert_ne!(r.is_error, Some(true));
     assert!(r.content.iter().any(|c| matches!(c, ContentBlock::Image(_))));
+    // history records which token made the change
+    let mut h = CallToolRequestParams::new("sprite_history");
+    h.arguments = json!({"name": "moon"}).as_object().cloned();
+    let hist = client.call_tool(h).await.unwrap();
+    let txt: String = hist.content.iter().filter_map(|c| if let ContentBlock::Text(t) = c { Some(t.text.clone()) } else { None }).collect();
+    assert!(txt.contains("create") && txt.contains("tester"), "{txt}");
     client.cancel().await.unwrap();
 
     // what the model just made is immediately available to prototypes over REST
