@@ -29,6 +29,10 @@ pub mod limits {
     pub const MAX_WEIGHT: f64 = 16.0;
     pub const MAX_HEIGHT: f64 = 16.0;
     pub const MAX_ANGLE: f64 = 3600.0;
+    /// sx / sy track amplitude (a scale factor, not pixels)
+    pub const MAX_SCALE_AMP: f64 = 8.0;
+    /// track phase, in loops
+    pub const MAX_PHASE: f64 = 100.0;
     pub const MAX_MS: f64 = 60_000.0;
     /// prims × frames: render time grows with both, so a 64-prim sprite can't also ask for 64
     /// frames. Worst case at this budget is a few seconds on one core; real sprites use < 300.
@@ -504,14 +508,14 @@ fn parse_track(v: &Value) -> Result<Track, String> {
     let amp_max = match prop {
         Prop::Rot => limits::MAX_ANGLE,
         Prop::Dx | Prop::Dy => limits::SIZE,
-        Prop::Sx | Prop::Sy => 8.0,
+        Prop::Sx | Prop::Sy => limits::MAX_SCALE_AMP,
     };
     if !(amp.is_finite() && amp.abs() <= amp_max) {
         return Err(format!("amp must be within ±{amp_max} for this prop (got {amp})"));
     }
     let phase = num(o, "phase").unwrap_or(0.0);
-    if !(phase.is_finite() && phase.abs() <= 100.0) {
-        return Err(format!("phase must be within ±100 (got {phase})"));
+    if !(phase.is_finite() && phase.abs() <= limits::MAX_PHASE) {
+        return Err(format!("phase must be within ±{} (got {phase})", limits::MAX_PHASE));
     }
     Ok(Track { g, prop, amp, wave, phase, pivot })
 }

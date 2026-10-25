@@ -174,6 +174,16 @@ async fn history_restore_and_conflicts() {
     std::fs::write(lib.join("broken.json"), "{ nope").unwrap();
     let list = text_of(&call(&c, "list_sprites", json!({})).await);
     assert!(list.starts_with("2 sprites") && list.contains("broken.json"), "{list}");
+
+    // ...and create won't replace it without overwrite; with overwrite, the damaged bytes are kept
+    let prims = json!([{"t": "rect", "p": [8, 8, 24, 28], "m": "glass"}]);
+    let refused = call(&c, "create_sprite", json!({"name": "broken", "category": "home", "prims": prims})).await;
+    assert_eq!(refused.is_error, Some(true));
+    assert!(text_of(&refused).contains("not valid JSON"), "{}", text_of(&refused));
+    assert_eq!(std::fs::read(lib.join("broken.json")).unwrap(), b"{ nope");
+    let replaced = call(&c, "create_sprite", json!({"name": "broken", "category": "home", "prims": prims, "overwrite": true})).await;
+    assert_ne!(replaced.is_error, Some(true), "{}", text_of(&replaced));
+    assert_eq!(std::fs::read(lib.join("_history/broken/000000.json")).unwrap(), b"{ nope");
     c.cancel().await.unwrap();
 }
 

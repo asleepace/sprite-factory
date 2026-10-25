@@ -311,20 +311,26 @@ impl SpriteServer {
     }
 
     /// Save `v` as a new revision, failing if the sprite moved past `expect_rev` (the rev the
-    /// caller started from; None = must not exist yet). The lock is held only for the check and
-    /// the write, never while rendering.
+    /// caller started from; None = there was no readable spec). The lock is held only for the
+    /// check and the write, never while rendering.
     fn commit(&self, name: &str, v: &mut Value, expect_rev: Option<u64>, op: &str, who: &str) -> Result<u64, String> {
         let _g = store::lock();
-        let current = std::fs::read(self.path(name)).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+        let bytes = std::fs::read(self.path(name)).ok();
+        let current = bytes.as_deref().and_then(|b| serde_json::from_slice::<Value>(b).ok());
         match (expect_rev, &current) {
-            (None, Some(_)) => return Err(format!("\"{name}\" was created by someone else just now. Use edit_sprite, or pass overwrite: true.")),
+            (None, Some(_)) if op != "overwrite" => {
+                return Err(format!("\"{name}\" was created by someone else just now. Nothing was saved; use edit_sprite, or pass overwrite: true."))
+            }
+            (None, None) if op == "create" && bytes.is_some() => {
+                return Err(format!("{name}.json appeared just now. Nothing was saved; pass overwrite: true to replace it."))
+            }
             (Some(want), Some(cur)) if store::rev_of(cur) != want => {
                 return Err(format!(
-                    "\"{name}\" changed while you were editing (now rev {}, you started from rev {want}). Nothing was saved; get_sprite and redo the edit.",
+                    "\"{name}\" changed since you read it (now rev {}, you started from rev {want}). Nothing was saved; get_sprite and try again.",
                     store::rev_of(cur)
                 ))
             }
-            (Some(_), None) if op == "edit" => return Err(format!("\"{name}\" was deleted while you were editing. Nothing was saved.")),
+            (Some(_), None) if op == "edit" || op == "restore" => return Err(format!("\"{name}\" was deleted since you read it. Nothing was saved.")),
             _ => {}
         }
         store::save(&self.lib, name, v, op, who)
@@ -375,9 +381,13 @@ impl SpriteServer {
             return Err(format!("category must be one of {CATEGORIES:?}"));
         }
         let overwrite = a.get("overwrite").and_then(Value::as_bool).unwrap_or(false);
-        let existing = std::fs::read(self.path(name)).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok());
-        if existing.is_some() && !overwrite {
-            return Err(format!("\"{name}\" already exists. Use edit_sprite, or pass overwrite: true to replace it."));
+        let on_disk = std::fs::read(self.path(name)).ok();
+        let existing = on_disk.as_deref().and_then(|b| serde_json::from_slice::<Value>(b).ok());
+        if on_disk.is_some() && !overwrite {
+            return Err(match existing {
+                Some(_) => format!("\"{name}\" already exists. Use edit_sprite, or pass overwrite: true to replace it."),
+                None => format!("{name}.json exists but is not valid JSON. Pass overwrite: true to replace it; the damaged file is kept in sprite_history."),
+            });
         }
         let was_deleted = store::is_deleted(&self.lib, name);
         let mut spec = Map::new();
@@ -398,7 +408,7 @@ impl SpriteServer {
         // validate + render before touching the library
         let mut res = render_result(&v, "", 8)?;
         let expect = existing.as_ref().map(store::rev_of);
-        let rev = self.commit(name, &mut v, expect, if expect.is_some() { "overwrite" } else { "create" }, who)?;
+        let rev = self.commit(name, &mut v, expect, if on_disk.is_some() { "overwrite" } else { "create" }, who)?;
         let mut head = format!("Created \"{name}\" (rev {rev}).");
         if was_deleted {
             head.push_str(" A deleted sprite had this name; its old revisions are still in sprite_history.");
@@ -511,12 +521,15 @@ impl SpriteServer {
         let rev = a.get("rev").and_then(Value::as_u64).ok_or("rev is required")?;
         let mut v = store::load_rev(&self.lib, n, rev)?;
         let mut res = render_result(&v, "", 8)?;
-        let current = std::fs::read(self.path(n)).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).map(|v| store::rev_of(&v));
-        let new = {
-            let _g = store::lock();
-            store::save(&self.lib, n, &mut v, "restore", who)?
+        let on_disk = std::fs::read(self.path(n)).ok();
+        let current = on_disk.as_deref().and_then(|b| serde_json::from_slice::<Value>(b).ok()).map(|v| store::rev_of(&v));
+        // commit refuses if the sprite was saved, deleted or recreated since we read `current`
+        let new = self.commit(n, &mut v, current, "restore", who)?;
+        let from = match (current, &on_disk) {
+            (Some(c), _) => format!("from rev {c} "),
+            (None, Some(_)) => "over a damaged file (kept in history) ".into(),
+            (None, None) => "from the trash ".into(),
         };
-        let from = current.map(|c| format!("from rev {c} ")).unwrap_or_else(|| "from the trash ".into());
         set_headline(&mut res, &format!("Restored \"{n}\" {from}to the shapes of rev {rev}, saved as rev {new}."));
         Ok(res)
     }
@@ -855,12 +868,14 @@ impl ServerHandler for SpriteServer {
                 Ok(CallToolResult::success(vec![text(guide), text(format!("materials (shade 0→4): {}", Value::Object(pal)))]).into())
             }
             "get_sprite" => self.load(arg_str(&args, "name").unwrap_or_default()).map(|v| CallToolResult::success(vec![text(serde_json::to_string_pretty(&v).unwrap())]).into()),
-            "delete_sprite" => self.delete_sprite(&args, &who).map(Into::into),
-            "sprite_history" => self.sprite_history(&args).map(Into::into),
-            // CPU-bound tools (and anything that takes the write lock) run off the async executor
-            "list_sprites" | "create_sprite" | "edit_sprite" | "restore_sprite" | "render_sprite" | "export_gif" | "export_atlas" => {
+            // CPU-bound tools and anything that touches the library's files (or takes the write
+            // lock) run off the async executor
+            "list_sprites" | "create_sprite" | "edit_sprite" | "delete_sprite" | "sprite_history" | "restore_sprite" | "render_sprite" | "export_gif"
+            | "export_atlas" => {
                 let res = tokio::task::spawn_blocking(move || match name.as_str() {
                     "list_sprites" => this.list_sprites(&args),
+                    "delete_sprite" => this.delete_sprite(&args, &who),
+                    "sprite_history" => this.sprite_history(&args),
                     "create_sprite" => this.create_sprite(&args, &who),
                     "edit_sprite" => this.edit_sprite(&args, &who),
                     "restore_sprite" => this.restore_sprite(&args, &who),

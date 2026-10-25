@@ -88,22 +88,33 @@ fn pretty(v: &Value) -> Vec<u8> {
 }
 
 /// Save `v` as the next revision of its sprite and return the new rev. Call with [`lock`] held.
-/// If the sprite has no history yet (it predates revs), its current file is kept as revision 0
-/// first, so the very first change is undoable too.
+/// Whatever is on disk is kept in history first if it isn't there already: a spec that predates
+/// revs becomes revision 0, and a file restored from a backup (stale rev) or one that no longer
+/// parses is kept as its own revision, so a save never loses the bytes it replaces.
 pub fn save(lib: &Path, name: &str, v: &mut Value, op: &str, by: &str) -> Result<u64, String> {
     let path = spec_path(lib, name);
     let hdir = history_dir(lib, name);
     let prev = std::fs::read(&path).ok();
     let prev_rev = prev.as_deref().and_then(|b| serde_json::from_slice::<Value>(b).ok()).map(|p| rev_of(&p));
-    // a new sprite may reuse a deleted one's name: keep counting from its last rev
-    let rev = prev_rev.unwrap_or_else(|| latest_rev(lib, name).unwrap_or(0)) + 1;
-    if let (Some(bytes), Some(r)) = (&prev, prev_rev) {
-        let snap = hdir.join(format!("{r:06}.json"));
-        if !snap.exists() {
-            write_atomic(&snap, bytes).map_err(|e| format!("could not keep history: {e}"))?;
-            log(lib, name, r, "import", "-").map_err(|e| e.to_string())?;
+    if let Some(bytes) = &prev {
+        let kept_at = prev_rev.map(|r| hdir.join(format!("{r:06}.json")));
+        match kept_at.as_ref().map(|snap| (snap, std::fs::read(snap).ok())) {
+            Some((_, Some(old))) if old == *bytes => {}
+            Some((snap, None)) => {
+                write_atomic(snap, bytes).map_err(|e| format!("could not keep history: {e}"))?;
+                log(lib, name, prev_rev.unwrap_or(0), "import", "-").map_err(|e| e.to_string())?;
+            }
+            // its rev is taken by different bytes, or it isn't valid JSON: keep it under a fresh rev
+            _ => {
+                let r = latest_rev(lib, name).max(prev_rev).map_or(0, |r| r + 1);
+                write_atomic(&hdir.join(format!("{r:06}.json")), bytes).map_err(|e| format!("could not keep history: {e}"))?;
+                log(lib, name, r, "import", "-").map_err(|e| e.to_string())?;
+            }
         }
     }
+    // never reuse a number: count past both the live file and everything already in history
+    // (a deleted sprite's name may be reused, and a restored backup may carry an older rev)
+    let rev = latest_rev(lib, name).max(prev_rev).map_or(1, |r| r + 1);
     v.as_object_mut().ok_or("spec is not an object")?.insert("rev".into(), json!(rev));
     let bytes = pretty(v);
     write_atomic(&hdir.join(format!("{rev:06}.json")), &bytes).map_err(|e| format!("could not keep history: {e}"))?;
@@ -241,6 +252,35 @@ mod tests {
         let mut v3 = json!({"name": "cup", "prims": [{"t": "ellipse", "c": [16, 16], "r": 8}]});
         assert_eq!(save(&l, "cup", &mut v3, "create", "colin").unwrap(), 3);
         assert_eq!(load_rev(&l, "cup", 2).unwrap()["prims"][0]["t"], "rect");
+    }
+
+    #[test]
+    fn a_stale_or_broken_live_file_never_overwrites_history() {
+        let l = lib();
+        let mut v = json!({"name": "mug", "prims": [{"t": "rect", "p": [8, 8, 24, 28]}]});
+        for want in 1..=3 {
+            assert_eq!(save(&l, "mug", &mut v, "edit", "colin").unwrap(), want);
+        }
+        // someone copies rev 1 back from a backup; saving must not reuse 2 or 3
+        let rev1 = std::fs::read(l.join("_history/mug/000001.json")).unwrap();
+        let rev3 = std::fs::read(l.join("_history/mug/000003.json")).unwrap();
+        std::fs::write(spec_path(&l, "mug"), &rev1).unwrap();
+        assert_eq!(save(&l, "mug", &mut v, "edit", "colin").unwrap(), 4);
+        assert_eq!(std::fs::read(l.join("_history/mug/000003.json")).unwrap(), rev3);
+
+        // a hand-edited file at rev 4 with different bytes is kept as its own revision
+        let mut edited: Value = serde_json::from_slice(&std::fs::read(spec_path(&l, "mug")).unwrap()).unwrap();
+        edited["prims"][0]["p"][3] = json!(30);
+        std::fs::write(spec_path(&l, "mug"), pretty(&edited)).unwrap();
+        assert_eq!(save(&l, "mug", &mut v, "edit", "colin").unwrap(), 6);
+        assert_eq!(load_rev(&l, "mug", 5).unwrap()["prims"][0]["p"][3], 30);
+
+        // a corrupt file is kept byte for byte before it is replaced
+        std::fs::write(spec_path(&l, "mug"), "{ oops").unwrap();
+        assert_eq!(save(&l, "mug", &mut v, "overwrite", "colin").unwrap(), 8);
+        assert_eq!(std::fs::read(l.join("_history/mug/000007.json")).unwrap(), b"{ oops");
+        let revs: Vec<u64> = revisions(&l, "mug").into_iter().map(|r| r.rev).collect();
+        assert_eq!(revs, (1..=8).collect::<Vec<_>>());
     }
 
     #[test]
