@@ -176,6 +176,9 @@ fn main() -> Result<()> {
                 .iter()
                 .map(|v| Spec::from_json(v, &pal).map(|s| (v.clone(), s)).map_err(|e| anyhow::anyhow!("{}: {}", library::spec_name(v), e.join("; "))))
                 .collect::<Result<_>>()?;
+            if let Some((v, s)) = parsed.iter().find(|(_, s)| !sprite_core::hd_size_ok_for(s, size)) {
+                bail!("{} is a {}px sprite; --size must be a larger multiple of {}", library::spec_name(v), s.size, s.size);
+            }
             let rendered = library::par_map(&parsed, |(_, s)| sprite_core::render_anim_hd(s, &pal, &opts, size));
             for ((v, s), frames) in parsed.iter().zip(rendered) {
                 let name = library::spec_name(v);

@@ -1,4 +1,5 @@
-//! Sprite Factory core: shape specs → lit, palette-locked, outlined 32×32 pixel-art frames.
+//! Sprite Factory core: shape specs → lit, palette-locked, outlined pixel-art frames on a 32×32
+//! (default), 64×64 or 128×128 canvas.
 //!
 //! No I/O and no platform dependencies, so the same code runs in the CLI, the MCP server and WASM.
 
@@ -11,12 +12,13 @@ pub mod render;
 pub mod spec;
 
 pub use palette::Palette;
-pub use render::{hd_size_ok, render_anim, render_anim_hd, render_frame, render_frame_hd, Frame, HdFrame, RenderOpts};
+pub use render::{hd_size_ok, hd_size_ok_for, render_anim, render_anim_hd, render_frame, render_frame_hd, Frame, HdFrame, RenderOpts};
 pub use spec::Spec;
 
-/// Output canvas size (px).
+/// Default canvas size (px); a spec's `size` can ask for 64 or 128. Everything tuned in pixels
+/// was tuned at this size and scales by `spec.size / SIZE`.
 pub const SIZE: usize = 32;
-/// Supersampling factor used for shading and coverage.
+/// Supersampling factor used for shading and coverage at 32px (fewer at bigger canvases).
 pub const SS: usize = 8;
 /// Default frames per animation loop.
 pub const FRAMES: usize = 8;

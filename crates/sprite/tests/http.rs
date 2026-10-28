@@ -182,6 +182,24 @@ fn rest_auth_and_assets() {
     assert_eq!((st, header(&head, "content-type")), (200, Some("image/gif")));
     assert!(!s.lib.join("tmp.json").exists());
 
+    // a 64px sprite: GIFs default to the same 128px as a 32px one at 4×, and cap at 512px
+    std::fs::write(
+        s.lib.join("ball64.json"),
+        json!({"name":"ball64","cat":"toys","size":64,"anim":"bob","prims":[{"t":"ellipse","c":[32,32],"r":22,"m":"blue"}]}).to_string(),
+    )
+    .unwrap();
+    let gif_w = |b: &[u8]| u16::from_le_bytes([b[6], b[7]]);
+    let (st, _, gif) = req(&s.addr, "GET", "/v1/sprites/ball64.gif", &[], b"");
+    assert_eq!((st, gif_w(&gif)), (200, 128));
+    assert_eq!(gif_w(&req(&s.addr, "GET", "/v1/sprites/ball64.gif?scale=16", &[], b"").2), 512);
+    let (_, _, png) = req(&s.addr, "GET", "/v1/sprites/ball64.png", &[], b"");
+    assert_eq!(u32::from_be_bytes(png[16..20].try_into().unwrap()), 64);
+    let (_, _, body) = req(&s.addr, "GET", "/v1/atlas.json?names=apple,ball64", &[], b"");
+    let mixed: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!((mixed["frames"]["ball64_0"]["frame"]["w"].as_u64(), mixed["frames"]["apple_0"]["frame"]["w"].as_u64()), (Some(64), Some(32)));
+    let (st, _, gif) = req(&s.addr, "POST", "/v1/render?format=gif", &[json_ct], br#"{"size":128,"prims":[{"t":"star","c":[64,64],"r":50,"m":"gold"}]}"#);
+    assert_eq!((st, gif_w(&gif)), (200, 128));
+
     assert_eq!(req(&s.addr, "GET", "/v1/sprites/nope.png", &[AUTH], b"").0, 404);
     assert_eq!(req(&s.addr, "GET", "/v1/sprites/..%2Fetc%2Fpasswd.json", &[AUTH], b"").0, 400);
 }

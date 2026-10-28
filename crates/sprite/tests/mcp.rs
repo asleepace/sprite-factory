@@ -237,6 +237,79 @@ async fn export_gif_links_to_the_public_url() {
     c.cancel().await.unwrap();
 }
 
+/// Width and height of a base64 PNG or GIF (both store them in fixed header slots).
+fn dims(b64: &str) -> (u32, u32) {
+    use base64::Engine;
+    let b = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+    if b.starts_with(b"GIF") {
+        (u16::from_le_bytes([b[6], b[7]]) as u32, u16::from_le_bytes([b[8], b[9]]) as u32)
+    } else {
+        (u32::from_be_bytes(b[16..20].try_into().unwrap()), u32::from_be_bytes(b[20..24].try_into().unwrap()))
+    }
+}
+
+#[tokio::test]
+async fn canvas_sizes() {
+    let lib = library();
+    let c = connect(Reviewer::default(), &lib, &[]).await;
+    seed(&c).await;
+    let ball = json!([{"t":"ellipse","c":[32,34],"r":24,"m":"red","gloss":true},{"t":"rect","p":[30,6,34,12],"m":"wood"}]);
+    let r = call(&c, "create_sprite", json!({"name": "big_ball", "category": "home", "size": 64, "anim": "bob", "prims": ball})).await;
+    assert_ne!(r.is_error, Some(true), "{}", text_of(&r));
+    let saved: Value = serde_json::from_slice(&std::fs::read(lib.join("big_ball.json")).unwrap()).unwrap();
+    assert_eq!(saved["size"], 64);
+    // the preview is ~256px whatever the canvas
+    let first_image = |r: &CallToolResult| r.content.iter().find_map(|c| if let ContentBlock::Image(i) = c { Some(i.data.clone()) } else { None }).unwrap();
+    assert_eq!(dims(&first_image(&r)), (256, 256));
+    assert!(!text_of(&r).contains("touches the canvas edge"), "{}", text_of(&r));
+    let r = call(&c, "render_sprite", json!({"name": "big_ball", "scale": 8})).await;
+    assert_eq!(dims(&first_image(&r)), (512, 512));
+    let r = call(&c, "render_sprite", json!({"name": "big_ball", "scale": 9})).await;
+    assert!(text_of(&r).contains("from 1 to 8 for a 64px sprite"), "{}", text_of(&r));
+
+    // export_gif: 256px by default, and the bytes come back as a GIF file resource too
+    let g = call(&c, "export_gif", json!({"name": "big_ball"})).await;
+    assert_ne!(g.is_error, Some(true), "{}", text_of(&g));
+    assert!(text_of(&g).contains("256×256px"), "{}", text_of(&g));
+    let blob = g.content.iter().find_map(|c| match c {
+        ContentBlock::Resource(r) => match &r.resource {
+            ResourceContents::BlobResourceContents { uri, mime_type, blob, .. } => Some((uri.clone(), mime_type.clone(), blob.clone())),
+            _ => None,
+        },
+        _ => None,
+    });
+    let (uri, mime, blob) = blob.expect("export_gif returns a blob resource");
+    assert_eq!((uri.as_str(), mime.as_deref()), ("sprite://big_ball.gif", Some("image/gif")));
+    assert_eq!(dims(&blob), (256, 256));
+    assert_eq!(blob, first_image(&g), "the resource is the same GIF as the preview");
+    let g = call(&c, "export_gif", json!({"name": "teapot"})).await;
+    assert!(text_of(&g).contains("256×256px"), "32px sprites keep the 8× default: {}", text_of(&g));
+
+    // changing size alone would leave the shapes in the old coordinates
+    let r = call(&c, "edit_sprite", json!({"name": "big_ball", "size": 32})).await;
+    assert_eq!(r.is_error, Some(true));
+    assert!(text_of(&r).contains("doesn't move or resize any shapes"), "{}", text_of(&r));
+    let r = call(&c, "edit_sprite", json!({"name": "big_ball", "size": 48, "prims": ball})).await;
+    assert!(text_of(&r).contains("size must be one of"), "{}", text_of(&r));
+    let small = json!([{"t":"ellipse","c":[16,17],"r":13.5,"m":"red"}]);
+    let r = call(&c, "edit_sprite", json!({"name": "big_ball", "size": 32, "prims": small})).await;
+    assert_ne!(r.is_error, Some(true), "{}", text_of(&r));
+    let r = call(&c, "edit_sprite", json!({"name": "big_ball", "size": 128, "prims": [{"t":"ellipse","c":[64,66],"r":54,"m":"red"}]})).await;
+    assert_ne!(r.is_error, Some(true), "{}", text_of(&r));
+
+    // mixed sizes: the atlas gives each frame its own w/h, and blind review shows them all
+    let a = call(&c, "export_atlas", json!({"file": "mixed"})).await;
+    assert_ne!(a.is_error, Some(true), "{}", text_of(&a));
+    let meta: Value = serde_json::from_slice(&std::fs::read(lib.join("_export/mixed.json")).unwrap()).unwrap();
+    assert_eq!(meta["frames"]["big_ball_0"]["frame"]["w"], 128);
+    assert_eq!(meta["frames"]["teapot_0"]["frame"]["w"], 32);
+    assert_eq!(meta["animations"]["big_ball"]["size"], 128);
+    assert!(meta["meta"]["spriteSize"].is_null());
+    let out = call(&c, "blind_review", json!({"names": ["teapot", "big_ball"]})).await;
+    assert!(text_of(&out).contains("#2="), "{}", text_of(&out));
+    c.cancel().await.unwrap();
+}
+
 /// Minimal mock of POST /v1/messages that checks the request shape and returns a canned reply.
 fn mock_messages_api() -> (String, std::thread::JoinHandle<Value>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

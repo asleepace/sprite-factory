@@ -58,7 +58,17 @@ fn resolve_pivot<'a>(pv: &Pivot, members: impl IntoIterator<Item = &'a Prim>) ->
 
 /// One matrix per primitive for time t ∈ [0,1).
 pub fn frame_transforms(spec: &Spec, t: f64) -> Vec<Mat> {
-    let mut tracks = preset(&spec.anim);
+    // presets are written for 32px; their pixel moves scale with the canvas
+    let u = spec.size as f64 / 32.0;
+    let mut tracks: Vec<Track> = preset(&spec.anim)
+        .into_iter()
+        .map(|mut t| {
+            if matches!(t.prop, Prop::Dx | Prop::Dy) {
+                t.amp *= u;
+            }
+            t
+        })
+        .collect();
     tracks.extend(spec.tracks.iter().cloned());
     let prims = &spec.prims;
     let mut g_mat = I3;

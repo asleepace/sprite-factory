@@ -15,7 +15,7 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use serde_json::{json, Value};
 use sprite_core::lint::lint;
-use sprite_core::{render_anim, Frame, Palette, RenderOpts, Spec, SIZE};
+use sprite_core::{render_anim, Frame, Palette, RenderOpts, Spec};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
@@ -264,6 +264,15 @@ fn qnum(q: &HashMap<String, String>, k: &str, default: usize, lo: usize, hi: usi
     q.get(k).and_then(|v| v.parse().ok()).unwrap_or(default).clamp(lo, hi)
 }
 
+/// ?scale= for a sprite whose canvas is `side` px. Defaults (4× for a GIF, 1× otherwise) and the
+/// 16× ceiling are for 32px sprites and shrink with bigger canvases, so a GIF comes out the same
+/// pixel size whatever the canvas (128px by default, at most 512px).
+fn qscale(q: &HashMap<String, String>, kind: &str, side: usize) -> usize {
+    let r = (side / sprite_core::SIZE).max(1);
+    let default = if kind == "gif" { (4 / r).max(1) } else { 1 };
+    qnum(q, "scale", default, 1, (16 / r).max(1))
+}
+
 /// GIF options from the query string: ?scale=, ?bg=transparent|rrggbb, ?loop=pingpong, ?repeat=N.
 fn gif_opts(q: &HashMap<String, String>, scale: usize) -> Result<imgio::GifOpts, ApiError> {
     let bad = |m: String| ApiError(StatusCode::BAD_REQUEST, json!({"error": m}));
@@ -296,7 +305,8 @@ fn png_of(frames: &[Frame], which: &str, scale: usize, frame: usize, durations: 
         "sheet" => (Rgba::strip(frames).scaled(scale).png().map_err(err)?, "image/png"),
         _ => {
             let f = &frames[frame.min(frames.len() - 1)];
-            let mut img = Rgba::new(SIZE * scale, SIZE * scale);
+            let side = f.size();
+            let mut img = Rgba::new(side * scale, side * scale);
             img.blit_frame(f, 0, 0, scale);
             (img.png().map_err(err)?, "image/png")
         }
@@ -324,7 +334,7 @@ async fn list(State(st): State<AppState>, Query(q): Query<HashMap<String, String
                 let animated = v.get("anim").and_then(Value::as_str).is_some_and(|a| a != "none")
                     || v.get("tracks").and_then(Value::as_array).is_some_and(|t| !t.is_empty());
                 Some(json!({
-                    "name": n, "category": cat,
+                    "name": n, "category": cat, "size": v.get("size").and_then(Value::as_u64).unwrap_or(32),
                     "anim": v.get("anim").cloned().unwrap_or(json!("none")),
                     "frames": if animated { v.get("frames").and_then(Value::as_u64).unwrap_or(8) } else { 1 },
                     "frameMs": v.get("ms").and_then(Value::as_u64).unwrap_or(110),
@@ -339,8 +349,9 @@ async fn list(State(st): State<AppState>, Query(q): Query<HashMap<String, String
     Ok(Json(json!({"count": rows.len(), "sprites": rows})))
 }
 
-/// GET /v1/sprites/{name}.json | .png | .gif | .sheet.png   (?scale=1..16, ?frame=N for .png;
-/// for .gif also ?bg=transparent|rrggbb, ?loop=forward|pingpong, ?repeat=N)
+/// GET /v1/sprites/{name}.json | .png | .gif | .sheet.png   (?scale=1..16 for a 32px sprite, fewer
+/// for bigger canvases, see `qscale`; ?frame=N for .png; for .gif also ?bg=transparent|rrggbb,
+/// ?loop=forward|pingpong, ?repeat=N)
 async fn sprite_file(
     State(st): State<AppState>,
     UrlPath(file): UrlPath<String>,
@@ -363,13 +374,15 @@ async fn sprite_file(
         let (_, bytes, h) = st.read_spec(&name)?;
         return Ok(cached(&headers, &etag(&[h]), "application/json", bytes));
     }
-    let default_scale = if kind == "gif" { 4 } else { 1 };
-    let scale = qnum(&q, "scale", default_scale, 1, 16);
     // the frame index only matters for a single PNG; GIF options only for a GIF
     let frame = if kind == "png" { qnum(&q, "frame", 0, 0, 255) } else { 0 };
-    let gopts = if kind == "gif" { gif_opts(&q, scale)? } else { imgio::GifOpts { scale, ..Default::default() } };
+    if kind == "gif" {
+        gif_opts(&q, 1)?; // reject bad GIF options before rendering
+    }
     let res = tokio::task::spawn_blocking(move || -> Result<Response, ApiError> {
         let (_, h, r) = st.frames(&name)?;
+        let scale = qscale(&q, kind, r.frames[0].size());
+        let gopts = if kind == "gif" { gif_opts(&q, scale)? } else { imgio::GifOpts { scale, ..Default::default() } };
         let tag = etag(&[h, scale as u64, frame as u64, kind.len() as u64, gif_key(&gopts, kind)]);
         if headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) == Some(tag.as_str()) {
             return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, tag)]).into_response());
@@ -452,12 +465,15 @@ async fn render_adhoc(Query(q): Query<HashMap<String, String>>, headers: HeaderM
     }
     let v: Value = serde_json::from_slice(&body).map_err(|e| ApiError(StatusCode::BAD_REQUEST, json!({"error": format!("body is not JSON: {e}")})))?;
     let format = q.get("format").cloned().unwrap_or_else(|| "png".into());
-    let scale = qnum(&q, "scale", if format == "gif" { 4 } else { 1 }, 1, 16);
-    let gopts = if format == "gif" { gif_opts(&q, scale)? } else { imgio::GifOpts { scale, ..Default::default() } };
+    if format == "gif" {
+        gif_opts(&q, 1)?;
+    }
     tokio::task::spawn_blocking(move || -> Result<Response, ApiError> {
         let pal = Palette::new();
         let spec = Spec::from_json(&v, &pal)
             .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, json!({"error": "invalid spec", "details": e})))?;
+        let scale = qscale(&q, if format == "gif" { "gif" } else { "png" }, spec.size);
+        let gopts = if format == "gif" { gif_opts(&q, scale)? } else { imgio::GifOpts { scale, ..Default::default() } };
         let frames = render_anim(&spec, &pal, &RenderOpts::default());
         if format == "json" {
             return Ok(Json(json!({"lint": lint(&spec, &frames)})).into_response());

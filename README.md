@@ -1,6 +1,6 @@
 # Sprite Factory
 
-One binary, `sprite`, that turns shape specs into consistent 32×32 pixel-art sprites, and
+One binary, `sprite`, that turns shape specs into consistent 32×32 (or 64×64 / 128×128) pixel-art sprites, and
 serves the whole pipeline to models over MCP. The house style (palette, light, outline,
 canvas) lives in the renderer, so every author — human or model — produces the same set.
 
@@ -38,10 +38,16 @@ sprite bench   testdata/nouns/*.json
 
 Inputs can be batch files (JSON arrays), single-spec files, or folders of either.
 
-**High definition.** Specs are vector shapes in 32px units, so `sprite hd` redraws them on a larger
-canvas instead of scaling pixels up: smooth curves, the same palette, light and cel-shading bands,
-proportionally thinner outlines. Shortcuts that only work at 32px (single-pixel teeth, stacked eye
-pixels) show up at HD, so prefer real shapes for features that matter.
+**Canvas size.** A spec's `"size": 64` or `128` authors the sprite on a bigger canvas, in that
+canvas's pixels, for characters and props that need more detail. It keeps the house style: same
+palette, light and shading steps, a 1px outline, and 1px `px` pixels for eyes and glints. Limits and
+style checks scale with the canvas; see AUTHORING.md for when to pick which.
+
+**High definition.** Specs are vector shapes, so `sprite hd` redraws them on a larger canvas
+instead of scaling pixels up: smooth curves, the same palette, light and cel-shading bands,
+proportionally thinner outlines. `--size` must be a larger multiple of the sprite's own canvas.
+Shortcuts that only work at the native size (single-pixel teeth, stacked eye pixels) show up at HD,
+so prefer real shapes for features that matter.
 
 ## MCP server
 
@@ -94,7 +100,7 @@ wasm-pack build crates/sprite-wasm --target web --release
 ```js
 import init, { render, palette } from "./pkg/sprite_wasm.js";
 await init();
-const out = render(JSON.stringify(spec)); // out.frames: Uint8Array of out.frameCount × 32×32 RGBA
+const out = render(JSON.stringify(spec)); // out.frames: Uint8Array of out.frameCount × out.size² RGBA
 ```
 
 ## Parity with the Python renderer

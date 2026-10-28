@@ -5,7 +5,6 @@ use std::collections::HashSet;
 
 use crate::render::Frame;
 use crate::spec::{Kind, Prop, Spec};
-use crate::SIZE;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Lint {
@@ -19,17 +18,20 @@ pub struct Lint {
 
 pub fn lint(spec: &Spec, frames: &[Frame]) -> Lint {
     let f0 = &frames[0];
+    let size = spec.size;
+    // the checks below were tuned on the 32px canvas; `u` scales their pixel thresholds
+    let u = size / 32;
     let mut warnings = Vec::new();
-    let (mut x0, mut y0, mut x1, mut y1) = (SIZE, SIZE, 0, 0);
+    let (mut x0, mut y0, mut x1, mut y1) = (size, size, 0, 0);
     let mut colors = HashSet::new();
-    for y in 0..SIZE {
-        for x in 0..SIZE {
+    for y in 0..size {
+        for x in 0..size {
             if f0.alpha(x, y) > 0 {
                 x0 = x0.min(x);
                 y0 = y0.min(y);
                 x1 = x1.max(x);
                 y1 = y1.max(y);
-                let k = (y * SIZE + x) * 4;
+                let k = (y * size + x) * 4;
                 colors.insert([f0.0[k], f0.0[k + 1], f0.0[k + 2]]);
             }
         }
@@ -38,19 +40,27 @@ pub fn lint(spec: &Spec, frames: &[Frame]) -> Lint {
         return Lint { warnings: vec!["sprite rendered empty".into()], bbox: [0; 4], span_px: 0, colors: 0, frames: frames.len(), prims: spec.prims.len() };
     }
     let span = (x1 - x0 + 1).max(y1 - y0 + 1);
-    if span < 26 {
-        warnings.push(format!("subject spans {span}px on its longest axis; aim for 26–30px so it fills the canvas"));
+    if span < 26 * u {
+        warnings.push(format!(
+            "subject spans {span}px on its longest axis; aim for {}–{}px so it fills the {size}px canvas",
+            26 * u,
+            30 * u
+        ));
     }
     for (k, f) in frames.iter().enumerate() {
-        let edge = (0..SIZE).any(|i| f.alpha(i, 0) > 0 || f.alpha(i, SIZE - 1) > 0 || f.alpha(0, i) > 0 || f.alpha(SIZE - 1, i) > 0);
+        let last = size - 1;
+        let edge = (0..size).any(|i| f.alpha(i, 0) > 0 || f.alpha(i, last) > 0 || f.alpha(0, i) > 0 || f.alpha(last, i) > 0);
         if edge {
-            warnings.push(format!("frame {k} touches the canvas edge, so the outline is clipped; keep shapes inside 1.5–30.5"));
+            warnings.push(format!(
+                "frame {k} touches the canvas edge, so the outline is clipped; keep shapes inside 1.5–{}.5",
+                size - 2
+            ));
             break;
         }
     }
     let upright = matches!(spec.cat.as_deref(), Some("animals" | "home" | "places" | "vehicles"));
-    if upright && y1 < 29 {
-        warnings.push(format!("lowest pixel is y={y1}; upright things should rest near y=30"));
+    if upright && y1 + 3 * u < size {
+        warnings.push(format!("lowest pixel is y={y1}; upright things should rest near y={}", size - 2));
     }
     if colors.len() < 6 {
         warnings.push(format!("only {} colours; sprite may look flat — vary materials or shading", colors.len()));

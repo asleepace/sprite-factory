@@ -6,7 +6,8 @@
 //! import init, { render, palette } from "./pkg/sprite_wasm.js";
 //! await init();
 //! const out = render(JSON.stringify(spec));      // throws a readable error for bad specs
-//! const frames = out.frames;                    // Uint8Array, out.frameCount × 32×32×4 RGBA
+//! const frames = out.frames;                    // Uint8Array, out.frameCount × size×size×4 RGBA
+//! const size = out.size;                        // canvas side: 32, 64 or 128 (the spec's `size`)
 //! const durations = out.durations;              // Uint32Array, ms per frame (ms × hold)
 //! const lint = JSON.parse(out.lint);            // { warnings, bbox, span_px, colors, frames, prims }
 //! ```
@@ -18,6 +19,7 @@ use wasm_bindgen::prelude::*;
 pub struct Rendered {
     frames: Vec<u8>,
     frame_count: usize,
+    size: usize,
     ms: u32,
     durations: Vec<u32>,
     lint: String,
@@ -25,10 +27,15 @@ pub struct Rendered {
 
 #[wasm_bindgen]
 impl Rendered {
-    /// All frames back to back, RGBA, 32×32 each.
+    /// All frames back to back, RGBA, `size`×`size` each.
     #[wasm_bindgen(getter)]
     pub fn frames(&self) -> Vec<u8> {
         self.frames.clone()
+    }
+    /// Canvas side in px (32, 64 or 128).
+    #[wasm_bindgen(getter)]
+    pub fn size(&self) -> usize {
+        self.size
     }
     #[wasm_bindgen(getter, js_name = frameCount)]
     pub fn frame_count(&self) -> usize {
@@ -59,6 +66,7 @@ pub fn render(spec_json: &str) -> Result<Rendered, JsError> {
     let durations = (0..frames.len()).map(|i| spec.frame_ms(i)).collect();
     Ok(Rendered {
         frame_count: frames.len(),
+        size: spec.size,
         frames: frames.into_iter().flat_map(|f| f.0).collect(),
         ms: spec.ms,
         durations,
@@ -84,7 +92,7 @@ pub fn palette() -> String {
     serde_json::Value::Object(m).to_string()
 }
 
-/// Canvas size in pixels (32).
+/// Default canvas size in pixels (32). A spec's `size` can ask for 64 or 128; see `Rendered.size`.
 #[wasm_bindgen(js_name = spriteSize)]
 pub fn sprite_size() -> usize {
     SIZE
