@@ -108,7 +108,7 @@ enum Cmd {
         #[arg(long, default_value_t = 1)]
         repeat: usize,
     },
-    /// Private HTTP server: MCP at /mcp + read-only REST for prototypes (bearer-token auth)
+    /// HTTP server: MCP at /mcp + read-only REST for prototypes (public reads/creates; write token to edit or delete)
     Serve {
         #[arg(long, env = "SPRITE_BIND", default_value = "127.0.0.1:8787")]
         bind: std::net::SocketAddr,

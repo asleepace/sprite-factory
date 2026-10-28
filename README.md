@@ -50,8 +50,10 @@ Local (stdio):
 claude mcp add sprite-factory -- /path/to/sprite mcp --library /path/to/library
 ```
 
-Hosted (private, token-only): `sprite serve` puts MCP at `/mcp` (Streamable HTTP) and a
-read-only REST API at `/v1` for game prototypes, both on the same library. See
+Hosted: `sprite serve` puts MCP at `/mcp` (Streamable HTTP) and a read-only REST API at `/v1`
+for game prototypes, both on the same library. Reading, rendering and creating new sprites are
+public; editing, deleting, restoring, overwriting and `blind_review` need a write token sent as a
+bearer header. See
 [`deploy/DEPLOY.md`](deploy/DEPLOY.md) for the systemd + nginx setup.
 ```bash
 SPRITE_TOKENS="me:$(openssl rand -hex 32)" sprite serve --library library --bind 127.0.0.1:8787
@@ -71,7 +73,7 @@ so any change can be undone with `restore_sprite`. `edit_sprite` takes `if_rev` 
 newer save. Specs are bounded (prims, points, smoothing, coordinates, prims × frames; see
 `sprite_core::spec::limits`) so a single spec can't exhaust the server.
 `export_gif` returns the animated GIF inline (exact palette, transparent by default) and, when
-`SPRITE_PUBLIC_URL` is set, a download URL for it.
+`SPRITE_PUBLIC_URL` is set, a download URL for it. See `deploy/DEPLOY.md` for which tools need a token.
 
 `blind_review` shows a fresh model an unlabeled, shuffled sheet and grades its guesses against
 each sprite's name and `aka` synonyms. It uses, in order:

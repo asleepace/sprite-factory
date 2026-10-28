@@ -1,6 +1,6 @@
-# Deploying to asleepace.com (private)
+# Deploying to asleepace.com
 
-What you get: `https://sprites.asleepace.com`, token-only, serving
+What you get: `https://sprites.asleepace.com`, public to read and create, write token to edit or delete, serving
 - **`/mcp`** — the Sprite Factory MCP server (Streamable HTTP) for Claude and other agents
 - **`/v1/...`** — read-only REST for game prototypes (PNG, GIF, sheets, atlases)
 
@@ -53,8 +53,8 @@ sudo certbot --nginx -d sprites.asleepace.com
 ```bash
 TOKEN=...   # from install.sh
 curl https://sprites.asleepace.com/healthz                                         # ok
-curl -H "Authorization: Bearer $TOKEN" https://sprites.asleepace.com/v1/sprites | head
-curl -o cat.gif -H "Authorization: Bearer $TOKEN" https://sprites.asleepace.com/v1/sprites/cat.gif
+curl https://sprites.asleepace.com/v1/sprites | head                               # public
+curl -o cat.gif https://sprites.asleepace.com/v1/sprites/cat.gif
 ```
 
 ## Use it
@@ -64,21 +64,20 @@ curl -o cat.gif -H "Authorization: Bearer $TOKEN" https://sprites.asleepace.com/
 claude mcp add --transport http sprite-factory https://sprites.asleepace.com/mcp \
   --header "Authorization: Bearer $TOKEN"
 ```
-In the Claude apps, add it as a custom connector with the same URL if your plan allows custom
-connectors with headers; otherwise use Claude Code or the stdio binary locally.
+Without the header, MCP still works for reading, rendering, exporting and creating new sprites;
+the keyed tools (below) answer with an error asking for a write token. In the Claude apps, add it as
+a custom connector with the same URL; add the header if your plan allows it, to unlock editing.
 
 **Game prototypes (Phaser)**
 ```ts
 const BASE = "https://sprites.asleepace.com/v1";
-const KEY = import.meta.env.VITE_SPRITE_KEY; // ?key= because image loaders can't set headers
-
-this.load.atlas("sprites", `${BASE}/atlas.png?scale=2&key=${KEY}`, `${BASE}/atlas.json?scale=2&key=${KEY}`);
+this.load.atlas("sprites", `${BASE}/atlas.png?scale=2`, `${BASE}/atlas.json?scale=2`);
 // later
 this.add.sprite(100, 100, "sprites", "cat_0");
 ```
 Animations: `atlas.json` lists each sprite's frames and `frameMs` under `animations`.
 
-**Plain `<img>`**: `https://sprites.asleepace.com/v1/sprites/apple.png?scale=4&key=…`
+**Plain `<img>`**: `https://sprites.asleepace.com/v1/sprites/apple.png?scale=4`
 
 For a prototype served from a dev origin that reads pixels (canvas), add that origin to
 `SPRITE_CORS` in `/etc/sprite/sprite.env`.
@@ -86,33 +85,47 @@ For a prototype served from a dev origin that reads pixels (canvas), add that or
 ## REST reference
 | Route | Notes |
 |---|---|
-| `GET /healthz` | no auth |
+| `GET /healthz` | |
 | `GET /v1/sprites?category=` | names, categories, frame counts, asset URLs |
 | `GET /v1/sprites/{name}.png` | `?scale=1..16&frame=N` |
 | `GET /v1/sprites/{name}.gif` | animated, timed from the spec's `ms`/`hold`; `?scale=` (default 4), `?bg=transparent\|rrggbb`, `?loop=forward\|pingpong`, `?repeat=N` |
 | `GET /v1/sprites/{name}.sheet.png` | all frames in a row |
 | `GET /v1/sprites/{name}.json` | the spec |
 | `GET /v1/atlas.png`, `/v1/atlas.json` | `?category=`, `?names=a,b`, `?scale=1..8`, `?max=` (largest side in px, default 4096, up to 8192). `413` if the selection doesn't fit; filter it or lower the scale. Identical frames share a cell, so look frames up by key |
-| `POST /v1/render?format=png\|gif\|sheet\|json` | render a spec without saving (256 KB limit) |
+| `POST /v1/render?format=png\|gif\|sheet\|json` | render a spec without saving (256 KB limit). Send it with `Content-Type: application/json` (anything else is a `415`), so other sites' pages can't call it without passing `SPRITE_CORS` |
 
 Everything returns an `ETag`; send `If-None-Match` to get `304` when nothing changed.
-Writes only happen through MCP (`create_sprite`, `edit_sprite`, `delete_sprite`, `restore_sprite`).
+No REST route needs a token. Writes only happen through MCP.
+
+## Access
+| | no token | write token (bearer header) |
+|---|---|---|
+| REST: list, PNG, GIF, sheet, spec, atlas, `POST /v1/render` | ✓ | ✓ |
+| MCP: `style_guide`, `list_sprites`, `get_sprite`, `render_sprite`, `sprite_history`, `export_gif` | ✓ | ✓ |
+| MCP: `create_sprite` with a name that has never been used (60 per hour across all tokenless callers; `SPRITE_ANON_CREATES_PER_HOUR`) | ✓ | ✓ |
+| MCP: `create_sprite` over an existing or deleted name, `edit_sprite`, `delete_sprite`, `restore_sprite` | | ✓ |
+| MCP: `export_atlas` (writes files; the REST atlas is public), `blind_review` (spends `ANTHROPIC_API_KEY` credits) | | ✓ |
+
+`export_gif` returns the GIF inline and as a URL for everyone, but only saves a copy in `_export/`
+for a write token. A token that doesn't match, or an `Authorization` header that isn't
+`Bearer <token>`, is a `401`, not a silent fall back to anonymous. History records who made each
+change: the token label, or `anon` (`anon` and `local` can't be used as token labels).
 
 ## Tokens
 `/etc/sprite/tokens` holds one `label:scope:token` per line. Give each person or prototype its own
 (`openssl rand -hex 32`), and delete a line to revoke it, then `systemctl restart sprite`.
 
-| scope | can use |
+| scope | adds |
 |---|---|
-| `read` | the REST API (`GET /v1/…`, `POST /v1/render`), by header or `?key=` |
-| `write` | everything `read` can, plus MCP (create, edit, delete, restore) — header only |
+| `read` | nothing beyond public access; labels the caller in history (header or `?key=`) |
+| `write` | the keyed MCP tools above — header only |
 
 ```
 colin:write:3f9c…
 racecar-proto:read:a71e…
 ```
-Give prototypes `read` tokens: `?key=` tokens end up in browser history and bundles, so MCP never
-accepts a token from the query string, and a leaked read token can't change the library.
+A `?key=` token ends up in browser history and bundles, so it never unlocks the keyed tools, even
+a write token; it's treated like a read token.
 Entries written as `label:token` (from before scopes) still work as `write`; the server prints a
 warning at startup until you add a scope.
 
