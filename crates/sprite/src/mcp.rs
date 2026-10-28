@@ -283,16 +283,24 @@ fn set_headline(res: &mut CallToolResult, head: &str) {
     }
 }
 
-/// Who is calling: the token label under `sprite serve`, or "local" over stdio.
-fn caller(ctx: &RequestContext<RoleServer>) -> String {
+/// Who is calling and whether they may use the keyed tools: the token label (or "anon") under
+/// `sprite serve`, or a privileged "local" over stdio.
+fn caller(ctx: &RequestContext<RoleServer>) -> (String, bool) {
     ctx.extensions
         .get::<axum::http::request::Parts>()
         .and_then(|p| p.extensions.get::<crate::http::Caller>())
-        .map(|c| c.0.clone())
-        .unwrap_or_else(|| "local".into())
+        .map(|c| (c.label.clone(), c.privileged))
+        .unwrap_or_else(|| ("local".into(), true))
 }
 
 impl SpriteServer {
+    /// Tools that change or delete an existing sprite, or spend API credits, need a write token.
+    /// Everything else (reading, rendering, exporting, creating a new sprite) is public.
+    pub(crate) fn keyed(tool: &str, args: &Map<String, Value>) -> bool {
+        matches!(tool, "edit_sprite" | "delete_sprite" | "restore_sprite" | "blind_review")
+            || (tool == "create_sprite" && args.get("overwrite").and_then(Value::as_bool).unwrap_or(false))
+    }
+
     fn path(&self, name: &str) -> PathBuf {
         self.lib.join(format!("{name}.json"))
     }
@@ -585,7 +593,7 @@ impl SpriteServer {
                 q.push(format!("repeat={r}"));
             }
             lines.push(format!(
-                "URL (needs your token as a Bearer header or &key=…): {}/v1/sprites/{name}.gif?{}",
+                "URL: {}/v1/sprites/{name}.gif?{}",
                 base.trim_end_matches('/'),
                 q.join("&")
             ));
@@ -857,8 +865,16 @@ impl ServerHandler for SpriteServer {
     async fn call_tool(&self, request: CallToolRequestParams, context: RequestContext<RoleServer>) -> Result<CallToolResponse, McpError> {
         let args = request.arguments.clone().unwrap_or_default();
         let this = self.clone();
-        let who = caller(&context);
+        let (who, privileged) = caller(&context);
         let name = request.name.to_string();
+        if !privileged && Self::keyed(&name, &args) {
+            let what = if name == "create_sprite" { "create_sprite with overwrite: true".to_string() } else { name.clone() };
+            return Ok(CallToolResult::error(vec![text(format!(
+                "{what} needs a write token sent as an Authorization: Bearer header. Reading, rendering, exporting and \
+                 creating new sprites work without one."
+            ))])
+            .into());
+        }
         let out: Result<CallToolResponse, String> = match name.as_str() {
             "blind_review" => self.blind_review(&args, &request, &context).await,
             "style_guide" => {

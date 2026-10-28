@@ -1,5 +1,7 @@
-//! `sprite serve` — private HTTP server: MCP (Streamable HTTP) at /mcp plus a small read-only
-//! REST API for game prototypes. Everything except /healthz needs a bearer token.
+//! `sprite serve` — HTTP server: MCP (Streamable HTTP) at /mcp plus a small read-only REST API
+//! for game prototypes. Reading, rendering and creating need no token; changing or deleting an
+//! existing sprite, and anything that spends API credits (blind_review), needs a write token sent
+//! as a bearer header. See `SpriteServer::keyed` for the exact list.
 
 use anyhow::{bail, Context, Result};
 use axum::body::Bytes;
@@ -52,8 +54,9 @@ struct AppState {
 
 // ───────────────────────── tokens ─────────────────────────
 
-/// What a token may do. `Read` covers the REST API (GET + ad-hoc render); `Write` also covers
-/// MCP, which is where sprites get created, edited and deleted.
+/// What a token may do beyond the public tools. `Read` only labels the caller (for history and
+/// logs); `Write`, sent as a bearer header, also unlocks the keyed MCP tools (edit, delete,
+/// restore, overwrite, blind_review).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Scope {
     Read,
@@ -121,13 +124,17 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// The token label behind a request, for handlers that want to log who did what.
+/// Who is behind a request: a token label (or "anon"), and whether they may change or delete
+/// existing sprites. Only a write token sent as a bearer header is privileged: `?key=` tokens end
+/// up in URLs, bundles and browser history, so they never authorize changes.
 #[derive(Debug, Clone)]
-pub(crate) struct Caller(pub String);
+pub(crate) struct Caller {
+    pub label: String,
+    pub privileged: bool,
+}
 
-/// Bearer header, or `?key=` for places that can't set headers (<img src>, Phaser loaders).
-/// MCP needs a write-scoped token sent as a header: `?key=` tokens end up in URLs, bundles and
-/// browser history, so they never authorize changes.
+/// No token → anonymous (public tools only). A token that doesn't match is a 401 rather than a
+/// silent downgrade, so a typo'd key shows up as an error instead of missing permissions.
 async fn auth(State(st): State<AppState>, mut req: Request, next: Next) -> Response {
     if req.uri().path() == "/healthz" || req.method() == Method::OPTIONS {
         return next.run(req).await;
@@ -142,24 +149,17 @@ async fn auth(State(st): State<AppState>, mut req: Request, next: Next) -> Respo
     let from_query = req.uri().query().and_then(|q| {
         q.split('&').find_map(|kv| kv.strip_prefix("key=").map(|v| v.to_string()))
     });
-    let presented = from_header.or(from_query);
-    let Some(tok) = presented.as_deref().and_then(|p| st.tokens.iter().find(|t| ct_eq(t.secret.as_bytes(), p.as_bytes()))) else {
-        return (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, "Bearer")], Json(json!({"error": "missing or invalid token"})))
-            .into_response();
+    let caller = match from_header.or(from_query) {
+        None => Caller { label: "anon".into(), privileged: false },
+        Some(p) => match st.tokens.iter().find(|t| ct_eq(t.secret.as_bytes(), p.as_bytes())) {
+            Some(tok) => Caller { label: tok.label.clone(), privileged: tok.scope == Scope::Write && via_header },
+            None => {
+                return (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, "Bearer")], Json(json!({"error": "invalid token"})))
+                    .into_response()
+            }
+        },
     };
-    if req.uri().path().starts_with("/mcp") {
-        let why = if tok.scope != Scope::Write {
-            Some("this token is read-only; MCP needs a write token")
-        } else if !via_header {
-            Some("MCP needs the token in an Authorization: Bearer header, not ?key=")
-        } else {
-            None
-        };
-        if let Some(why) = why {
-            return (StatusCode::FORBIDDEN, Json(json!({"error": why}))).into_response();
-        }
-    }
-    req.extensions_mut().insert(Caller(tok.label.clone()));
+    req.extensions_mut().insert(caller);
     next.run(req).await
 }
 
@@ -478,8 +478,8 @@ pub fn serve(o: ServeOpts) -> Result<()> {
     let unscoped: Vec<&str> = tokens.iter().filter(|t| !t.explicit).map(|t| t.label.as_str()).collect();
     if !unscoped.is_empty() {
         eprintln!(
-            "sprite serve: token(s) {} have no scope and can write via MCP; write them as label:read:token \
-             (prototypes, ?key= use) or label:write:token",
+            "sprite serve: token(s) {} have no scope and can edit and delete via MCP; write them as \
+             label:read:token (prototypes, ?key= use) or label:write:token",
             unscoped.join(", ")
         );
     }
