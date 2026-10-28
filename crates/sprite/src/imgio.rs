@@ -22,19 +22,21 @@ impl Rgba {
         Rgba { w, h, px: vec![0; w * h * 4] }
     }
 
-    /// Frames side by side.
+    /// Frames side by side (all one sprite, so all one size).
     pub fn strip(frames: &[Frame]) -> Self {
-        let mut out = Rgba::new(SIZE * frames.len(), SIZE);
+        let side = frames.first().map_or(SIZE, Frame::size);
+        let mut out = Rgba::new(side * frames.len(), side);
         for (k, f) in frames.iter().enumerate() {
-            out.blit_frame(f, k * SIZE, 0, 1);
+            out.blit_frame(f, k * side, 0, 1);
         }
         out
     }
 
     pub fn blit_frame(&mut self, f: &Frame, x0: usize, y0: usize, scale: usize) {
-        for y in 0..SIZE * scale {
-            for x in 0..SIZE * scale {
-                let s = ((y / scale) * SIZE + x / scale) * 4;
+        let side = f.size();
+        for y in 0..side * scale {
+            for x in 0..side * scale {
+                let s = ((y / scale) * side + x / scale) * 4;
                 let d = ((y0 + y) * self.w + x0 + x) * 4;
                 self.px[d..d + 4].copy_from_slice(&f.0[s..s + 4]);
             }
@@ -171,10 +173,18 @@ pub struct GifInfo {
     pub loop_ms: u64,
 }
 
-/// Animated GIF from 32×32 sprite frames. `durations` is ms per frame (see `Spec::frame_ms`).
+/// Animated GIF from one sprite's frames. `durations` is ms per frame (see `Spec::frame_ms`).
 pub fn gif(frames: &[Frame], durations: &[u32], o: &GifOpts) -> Result<(Vec<u8>, GifInfo)> {
     let bufs: Vec<&[u8]> = frames.iter().map(|f| f.0.as_slice()).collect();
-    encode_gif(&bufs, SIZE, durations, o)
+    encode_gif(&bufs, frames.first().map_or(SIZE, Frame::size), durations, o)
+}
+
+/// Shared display side for a set of frames of mixed sizes: at least `32 × scale`, a whole multiple
+/// of the largest frame, so each frame fills it by an integer upscale (32px frames at `scale` when
+/// every frame is 32px).
+fn display_side<'a>(frames: impl IntoIterator<Item = &'a Frame>, scale: usize) -> usize {
+    let biggest = frames.into_iter().map(Frame::size).max().unwrap_or(SIZE);
+    biggest * (SIZE * scale).div_ceil(biggest).max(1)
 }
 
 /// Animated GIF from square RGBA buffers of side `side` (32px frames or HD frames).
@@ -411,20 +421,22 @@ pub fn parse_bg(s: &str) -> std::result::Result<Option<[u8; 3]>, String> {
 }
 
 /// Grid of first frames with a label under each — the image a model critiques.
+/// Every sprite fills the same cell whatever its canvas size, so a blind reviewer compares them fairly.
 pub fn contact_sheet(items: &[(String, Frame)], scale: usize, cols: usize) -> Rgb {
     let cols = cols.max(1).min(items.len().max(1));
     let label_scale = if scale >= 4 { 2 } else { 1 };
-    let cell_w = (SIZE * scale + 16).max(font::text_width("MMMMMMMMMMMM", label_scale) / 2);
-    let cell_h = SIZE * scale + 16 + font::GLYPH_H * label_scale + 6;
+    let d = display_side(items.iter().map(|i| &i.1), scale);
+    let cell_w = (d + 16).max(font::text_width("MMMMMMMMMMMM", label_scale) / 2);
+    let cell_h = d + 16 + font::GLYPH_H * label_scale + 6;
     let rows = items.len().div_ceil(cols).max(1);
     let mut sheet = Rgb::new(cols * cell_w, rows * cell_h, [236, 232, 224]);
     for (k, (label, f)) in items.iter().enumerate() {
         let (x, y) = ((k % cols) * cell_w, (k / cols) * cell_h);
-        sheet.fill(x + 4, y + 4, SIZE * scale + 8, SIZE * scale + 8, BACKDROP);
-        let mut img = Rgba::new(SIZE * scale, SIZE * scale);
-        img.blit_frame(f, 0, 0, scale);
+        sheet.fill(x + 4, y + 4, d + 8, d + 8, BACKDROP);
+        let mut img = Rgba::new(d, d);
+        img.blit_frame(f, 0, 0, d / f.size());
         sheet.paste(&img, x + 8, y + 8);
-        sheet.text(x + 6, y + SIZE * scale + 16, &label.replace('_', " "), label_scale, [40, 40, 50]);
+        sheet.text(x + 6, y + d + 16, &label.replace('_', " "), label_scale, [40, 40, 50]);
     }
     sheet
 }
@@ -432,16 +444,17 @@ pub fn contact_sheet(items: &[(String, Frame)], scale: usize, cols: usize) -> Rg
 /// One row per sprite with every animation frame.
 pub fn strip_sheet(rows: &[(String, Vec<Frame>)], scale: usize) -> Rgb {
     let nmax = rows.iter().map(|r| r.1.len()).max().unwrap_or(1);
-    let cw = SIZE * scale + 4;
+    let d = display_side(rows.iter().flat_map(|r| &r.1), scale);
+    let cw = d + 4;
     let label_w = 100;
     let mut sheet = Rgb::new(label_w + nmax * cw, rows.len().max(1) * cw, [236, 232, 224]);
     for (r, (name, frames)) in rows.iter().enumerate() {
         sheet.text(4, r * cw + cw / 2 - 4, &name.replace('_', " "), 1, [40, 40, 50]);
         for (k, f) in frames.iter().enumerate() {
             let (x, y) = (label_w + k * cw, r * cw + 2);
-            sheet.fill(x, y, SIZE * scale, SIZE * scale, BACKDROP);
-            let mut img = Rgba::new(SIZE * scale, SIZE * scale);
-            img.blit_frame(f, 0, 0, scale);
+            sheet.fill(x, y, d, d, BACKDROP);
+            let mut img = Rgba::new(d, d);
+            img.blit_frame(f, 0, 0, d / f.size());
             sheet.paste(&img, x, y);
         }
     }

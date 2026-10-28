@@ -86,12 +86,12 @@ For a prototype served from a dev origin that reads pixels (canvas), add that or
 | Route | Notes |
 |---|---|
 | `GET /healthz` | |
-| `GET /v1/sprites?category=` | names, categories, frame counts, asset URLs |
-| `GET /v1/sprites/{name}.png` | `?scale=1..16&frame=N` |
-| `GET /v1/sprites/{name}.gif` | animated, timed from the spec's `ms`/`hold`; `?scale=` (default 4), `?bg=transparent\|rrggbb`, `?loop=forward\|pingpong`, `?repeat=N` |
+| `GET /v1/sprites?category=` | names, categories, canvas sizes, frame counts, asset URLs |
+| `GET /v1/sprites/{name}.png` | `?scale=1..16&frame=N` (scale up to 8 for a 64px sprite, 4 for 128px) |
+| `GET /v1/sprites/{name}.gif` | animated, timed from the spec's `ms`/`hold`; `?scale=` (default 4 for a 32px sprite, 2 at 64, 1 at 128: 128px wide; at most 512px), `?bg=transparent\|rrggbb`, `?loop=forward\|pingpong`, `?repeat=N` |
 | `GET /v1/sprites/{name}.sheet.png` | all frames in a row |
 | `GET /v1/sprites/{name}.json` | the spec |
-| `GET /v1/atlas.png`, `/v1/atlas.json` | `?category=`, `?names=a,b`, `?scale=1..8`, `?max=` (largest side in px, default 4096, up to 8192). `413` if the selection doesn't fit; filter it or lower the scale. Identical frames share a cell, so look frames up by key |
+| `GET /v1/atlas.png`, `/v1/atlas.json` | `?category=`, `?names=a,b`, `?scale=1..8`, `?max=` (largest side in px, default 4096, up to 8192). `413` if the selection doesn't fit; filter it or lower the scale. Identical frames share a cell, so look frames up by key. Sprites of different canvas sizes get cells of their own size: read each frame's `w`/`h` (`meta.spriteSize` is only set when every sprite shares one) |
 | `POST /v1/render?format=png\|gif\|sheet\|json` | render a spec without saving (256 KB limit). Send it with `Content-Type: application/json` (anything else is a `415`), so other sites' pages can't call it without passing `SPRITE_CORS` |
 
 Everything returns an `ETag`; send `If-None-Match` to get `304` when nothing changed.

@@ -7,14 +7,25 @@ use crate::raster::{edt, fill_polygon, gaussian, gradient, stroke, Mask};
 use crate::spec::{Kind, Prim, Spec};
 use crate::{SIZE, SS};
 
-/// One 32×32 RGBA frame, row-major.
+/// One square RGBA frame, row-major, at the sprite's canvas size (32, 64 or 128 px a side).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame(pub Vec<u8>);
 
 impl Frame {
-    pub fn alpha(&self, x: usize, y: usize) -> u8 {
-        self.0[(y * SIZE + x) * 4 + 3]
+    /// Side length in px.
+    pub fn size(&self) -> usize {
+        (self.0.len() / 4).isqrt()
     }
+
+    pub fn alpha(&self, x: usize, y: usize) -> u8 {
+        self.0[(y * self.size() + x) * 4 + 3]
+    }
+}
+
+/// Supersampling for a native render. The supersampled grid stays 256px whatever the canvas, so a
+/// 128px sprite costs about what a 32px one does per prim (8× at 32, 4× at 64, 2× at 128).
+fn native_ss(size: usize) -> usize {
+    (SS * SIZE / size).max(2)
 }
 
 /// Rasterizer tuning; the defaults were chosen to match the Python renderer's output.
@@ -52,10 +63,10 @@ fn shade_from_normal(nx: f64, ny: f64, nz: f64, l: &[f64; 3], gloss: bool) -> i3
 }
 
 pub fn render_frame(spec: &Spec, t: f64, pal: &Palette, opts: &RenderOpts) -> Frame {
-    Frame(render_sized(spec, t, pal, opts, SIZE, SS))
+    Frame(render_sized(spec, t, pal, opts, spec.size, native_ss(spec.size)))
 }
 
-/// A high-definition frame: the same spec drawn on a `size`×`size` canvas instead of 32×32.
+/// A high-definition frame: the same spec drawn on a `size`×`size` canvas instead of its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HdFrame {
     pub size: usize,
@@ -67,11 +78,17 @@ pub fn hd_size_ok(size: usize) -> bool {
     (64..=1024).contains(&size) && size.is_multiple_of(32)
 }
 
-/// Draw the spec at `size`×`size` (a multiple of 32). Curves come from the vector shapes, so the
-/// result is genuinely higher resolution, not an upscale. Shading bands, palette and outline style
-/// match the 32px sprite; outlines and edge lines get thinner relative to the body.
+/// Whether `spec` can be drawn at `size` by `render_frame_hd`: an HD size larger than, and a
+/// whole multiple of, the sprite's own canvas.
+pub fn hd_size_ok_for(spec: &Spec, size: usize) -> bool {
+    hd_size_ok(size) && size > spec.size && size.is_multiple_of(spec.size)
+}
+
+/// Draw the spec at `size`×`size` (a multiple of its canvas). Curves come from the vector shapes,
+/// so the result is genuinely higher resolution, not an upscale. Shading bands, palette and
+/// outline style match the native sprite; outlines and edge lines get thinner relative to the body.
 pub fn render_frame_hd(spec: &Spec, t: f64, pal: &Palette, opts: &RenderOpts, size: usize) -> HdFrame {
-    assert!(hd_size_ok(size), "HD size must be a multiple of 32 between 64 and 1024");
+    assert!(hd_size_ok_for(spec, size), "HD size must be a multiple of the sprite's canvas, larger than it, and at most 1024");
     HdFrame { size, px: render_sized(spec, t, pal, opts, size, 2) }
 }
 
@@ -83,10 +100,14 @@ pub fn render_anim_hd(spec: &Spec, pal: &Palette, opts: &RenderOpts, size: usize
     (0..f).map(|i| render_frame_hd(spec, i as f64 / f as f64, pal, opts, size)).collect()
 }
 
-/// Core renderer: output `size`×`size` RGBA, supersampled `ss`×. Spec coordinates are always in
-/// 32px sprite units; `k` = output px per sprite px, `cs` = supersampled px per sprite px.
+/// Core renderer: output `size`×`size` RGBA, supersampled `ss`×. Spec coordinates are in canvas
+/// px (`spec.size` a side); `k` = output px per canvas px. `u` = canvas px per 32px-sprite px:
+/// anything tuned in 32px units (the shading blur) is scaled by it, so a shape drawn at 2×
+/// coordinates on a 64px canvas shades like the 32px one, only crisper.
 fn render_sized(spec: &Spec, t: f64, pal: &Palette, opts: &RenderOpts, size: usize, ss: usize) -> Vec<u8> {
-    let k = size / 32;
+    let k = size / spec.size;
+    let u = spec.size as f64 / SIZE as f64;
+    let mid = spec.size as f64 / 2.0;
     let n = size * ss;
     let prims = &spec.prims;
     let pm = frame_transforms(spec, t);
@@ -104,9 +125,9 @@ fn render_sized(spec: &Spec, t: f64, pal: &Palette, opts: &RenderOpts, size: usi
             m = mul(&m, &affine(p.rot, 1.0, 1.0, 0.0, 0.0, ctr));
         }
         if p.flipx {
-            m = mul(&m, &affine(0.0, -1.0, 1.0, 0.0, 0.0, [16.0, 16.0]));
+            m = mul(&m, &affine(0.0, -1.0, 1.0, 0.0, 0.0, [mid, mid]));
         }
-        let ssf = (k * ss) as f64; // coordinate scale: sprite px → supersampled px
+        let ssf = (k * ss) as f64; // coordinate scale: canvas px → supersampled px
         let mut mask = Mask::new(n);
         match &outline {
             Outline::Poly(pts) => {
@@ -167,7 +188,7 @@ fn render_sized(spec: &Spec, t: f64, pal: &Palette, opts: &RenderOpts, size: usi
         let Some([bx0, by0, bx1, by1]) = mask.bbox() else { continue };
         let bw = (bx1 - bx0 + 1) as f64 / ssf;
         let bh = (by1 - by0 + 1) as f64 / ssf;
-        let sigma = 1.2 * ssf / 8.0;
+        let sigma = 1.2 * ssf * u / 8.0;
         let margin = 8usize.max((4.0 * sigma) as usize + 4);
         let cx0 = bx0.saturating_sub(margin);
         let cy0 = by0.saturating_sub(margin);
@@ -421,12 +442,22 @@ fn px_offsets(prims: &[Prim], pm: &[Mat], k: usize) -> Vec<Vec<[f64; 2]>> {
         a
     }
     let same = |a: usize, b: usize| prims[a].g == prims[b].g && pm[a] == pm[b];
+    // points by cell, so each point only looks at its 3×3 neighbourhood (px budgets reach 16k)
+    let mut by_cell: std::collections::HashMap<[i64; 2], Vec<usize>> = std::collections::HashMap::new();
+    for (a, p) in pts.iter().enumerate() {
+        by_cell.entry(p.2).or_default().push(a);
+    }
     for a in 0..pts.len() {
-        for b in a + 1..pts.len() {
-            let (ca, cb) = (pts[a].2, pts[b].2);
-            if (ca[0] - cb[0]).abs() <= 1 && (ca[1] - cb[1]).abs() <= 1 && same(pts[a].0, pts[b].0) {
-                let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
-                parent[ra] = rb;
+        let ca = pts[a].2;
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                let Some(near) = by_cell.get(&[ca[0] + dx, ca[1] + dy]) else { continue };
+                for &b in near {
+                    if b > a && same(pts[a].0, pts[b].0) {
+                        let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+                        parent[ra] = rb;
+                    }
+                }
             }
         }
     }

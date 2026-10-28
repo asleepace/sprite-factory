@@ -14,7 +14,7 @@ use rmcp::model::{
     ProtocolVersion, Role, SamplingContent, SamplingMessage, SamplingMessageContentBlock, ServerCapabilities, ServerConfig,
     Tool,
 };
-use rmcp::model::{ContextInclusion, ImageContent};
+use rmcp::model::{ContextInclusion, ImageContent, ResourceContents};
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler, ServiceExt};
 use serde_json::{json, Map, Value};
@@ -70,7 +70,7 @@ impl SpriteServer {
 fn prim_schema() -> Value {
     json!({
         "type": "object",
-        "description": "One shape. Coordinates on a 32×32 canvas, y down. See style_guide for every field.",
+        "description": "One shape. Coordinates in the sprite's canvas pixels (0–32 by default, 0–64 or 0–128 with size), y down. See style_guide for every field.",
         "properties": {
             "t": {"type": "string", "enum": ["ellipse", "rect", "poly", "arc", "star", "ngon", "line", "px"]},
             "m": {"type": "string", "enum": MATERIALS, "description": "material (colour ramp); never raw colours"},
@@ -118,6 +118,11 @@ fn anim_schema() -> Value {
     json!({"type": "string", "enum": sprite_core::anim::PRESET_NAMES})
 }
 
+fn size_schema() -> Value {
+    json!({"type": "integer", "enum": sprite_core::spec::limits::SIZES,
+        "description": "canvas side in px (default 32). 64 or 128 for characters with hands and faces, or small props that need detail. Coordinates are in these pixels."})
+}
+
 /// Timing fields shared by create_sprite and edit_sprite.
 fn timing_props() -> [(&'static str, Value); 4] {
     [
@@ -156,9 +161,10 @@ fn tools() -> Vec<Tool> {
             obj(json!({"category": {"type": "string", "enum": CATEGORIES}, "sheet": {"type": "boolean"}}), &[])),
         t("get_sprite", "Get sprite spec", "Returns a sprite's JSON spec (useful as a reference for a related sprite).", obj(json!({"name": name_schema()}), &["name"])),
         t("create_sprite", "Create sprite",
-            "Creates a sprite from shapes, renders it and saves it. Returns the sprite, its animation frames and style warnings. Keep shapes inside 1.5–30.5.",
+            "Creates a sprite from shapes, renders it and saves it. Returns the sprite, its animation frames and style warnings. Keep shapes inside 1.5–(size − 1.5): 30.5 at 32px, 62.5 at 64, 126.5 at 128.",
             obj(with_timing(json!({
                 "name": name_schema(),
+                "size": size_schema(),
                 "category": {"type": "string", "enum": CATEGORIES},
                 "aka": {"type": "array", "items": {"type": "string"}, "description": "other words a child might use (bunny for rabbit); used by blind_review"},
                 "anim": anim_schema(),
@@ -167,9 +173,11 @@ fn tools() -> Vec<Tool> {
                 "overwrite": {"type": "boolean"}
             })), &["name", "category", "prims"])),
         t("edit_sprite", "Edit sprite",
-            "Changes an existing sprite and re-renders it. prim_ops (set/merge/insert/delete by index, applied in order) for surgical edits, or prims to replace all shapes.",
+            "Changes an existing sprite and re-renders it. prim_ops (set/merge/insert/delete by index, applied in order) for surgical edits, or prims to replace all shapes. \
+             Changing size doesn't move shapes, so it needs prims redrawn for the new canvas.",
             obj(with_timing(json!({
                 "name": name_schema(),
+                "size": size_schema(),
                 "anim": anim_schema(),
                 "tracks": {"type": "array", "items": track_schema(), "maxItems": sprite_core::spec::limits::MAX_TRACKS},
                 "aka": {"type": "array", "items": {"type": "string"}},
@@ -182,7 +190,8 @@ fn tools() -> Vec<Tool> {
                 }, "required": ["op", "index"]}}
             })), &["name"])),
         t("render_sprite", "Render sprite", "Renders an existing sprite without changing it.",
-            obj(json!({"name": name_schema(), "scale": {"type": "integer", "minimum": 1, "maximum": 16}}), &["name"])),
+            obj(json!({"name": name_schema(), "scale": {"type": "integer", "minimum": 1, "maximum": 16,
+                "description": "upscale; default about 256px wide (8 at 32px, 4 at 64, 2 at 128), at most 512px"}}), &["name"])),
         t("delete_sprite", "Delete sprite", "Removes a sprite from the library. Its history is kept, so restore_sprite can bring it back.", obj(json!({"name": name_schema()}), &["name"])),
         t("sprite_history", "Sprite history", "Lists a sprite's saved revisions (rev, what changed, who, when), including sprites that were deleted.",
             obj(json!({"name": name_schema()}), &["name"])),
@@ -193,12 +202,13 @@ fn tools() -> Vec<Tool> {
             "Tests whether sprites are recognisable without their names: a fresh model sees an unlabeled, shuffled sheet and its guesses are graded. Uses ANTHROPIC_API_KEY if set, else MCP sampling, else returns the sheet and key for a separate reviewer.",
             obj(json!({"names": {"type": "array", "items": name_schema(), "minItems": 1, "maxItems": 30}}), &["names"])),
         t("export_gif", "Export GIF",
-            "Renders a sprite as an animated GIF and returns it (plus a download URL when the server has a public address). \
+            "Renders a sprite as an animated GIF and returns it as a preview image and as a GIF file resource the client can save \
+             (plus a download URL when the server has a public address). \
              Uses the renderer's exact palette, so colours never shift and the background can be truly transparent. \
              Timing comes from the sprite's ms and hold. With a write token, also saved to the library's _export folder.",
             obj(json!({
                 "name": name_schema(),
-                "scale": {"type": "integer", "minimum": 1, "maximum": 16, "description": "nearest-neighbour upscale (default 8 → 256px)"},
+                "scale": {"type": "integer", "minimum": 1, "maximum": 16, "description": "nearest-neighbour upscale; default makes it 256px (8 at 32px, 4 at 64, 2 at 128), at most 512px"},
                 "bg": {"type": "string", "description": "\"transparent\" (default) or a hex colour like #f6f5f0"},
                 "pingpong": {"type": "boolean", "description": "play forward then backward instead of wrapping"},
                 "repeat": {"type": "integer", "minimum": 1, "description": "times to play; omit to loop forever"}
@@ -255,8 +265,21 @@ fn render_spec(v: &Value) -> Result<(Spec, Vec<Frame>), Vec<String>> {
     Ok((s, f))
 }
 
-fn render_result(v: &Value, headline: &str, scale: usize) -> ToolOut {
+/// Upscale for a preview of a `side`px sprite: `want` if it keeps the image within 512px,
+/// otherwise the largest that does; by default about 256px.
+fn preview_scale(side: usize, want: Option<u64>) -> Result<usize, String> {
+    let max = (512 / side).max(1);
+    match want {
+        None => Ok((256 / side).max(1)),
+        Some(s) if (1..=max as u64).contains(&s) => Ok(s as usize),
+        Some(_) => Err(format!("scale must be a whole number from 1 to {max} for a {side}px sprite (at most 512px)")),
+    }
+}
+
+fn render_result(v: &Value, headline: &str, scale: Option<u64>) -> ToolOut {
     let (s, frames) = render_spec(v).map_err(|e| format!("Not saved — the spec is invalid:\n- {}", e.join("\n- ")))?;
+    let side = s.size;
+    let scale = preview_scale(side, scale)?;
     let l = lint(&s, &frames);
     let mut lines = vec![
         headline.to_string(),
@@ -264,12 +287,12 @@ fn render_result(v: &Value, headline: &str, scale: usize) -> ToolOut {
     ];
     lines.push(if l.warnings.is_empty() { "style warnings: none".into() } else { format!("style warnings:\n- {}", l.warnings.join("\n- ")) });
     lines.push("Look at the image: would a 5-year-old name it instantly? Revise with edit_sprite if not.".into());
-    let mut big = Rgba::new(sprite_core::SIZE * scale, sprite_core::SIZE * scale);
+    let mut big = Rgba::new(side * scale, side * scale);
     big.blit_frame(&frames[0], 0, 0, scale);
     let still = big.on_backdrop(BACKDROP).png().map_err(|e| e.to_string())?;
     let mut content = vec![text(lines.join("\n")), image_b64(&still)];
     if frames.len() > 1 {
-        let strip = Rgba::strip(&frames).scaled((scale / 2).max(2)).on_backdrop(BACKDROP).png().map_err(|e| e.to_string())?;
+        let strip = Rgba::strip(&frames).scaled((scale / 2).max(64 / side).max(1)).on_backdrop(BACKDROP).png().map_err(|e| e.to_string())?;
         content.push(text(format!("animation frames ({}):", s.anim)));
         content.push(image_b64(&strip));
     }
@@ -427,6 +450,9 @@ impl SpriteServer {
         let mut spec = Map::new();
         spec.insert("name".into(), json!(name));
         spec.insert("cat".into(), json!(cat));
+        if let Some(size) = a.get("size").filter(|x| !x.is_null()) {
+            spec.insert("size".into(), size.clone());
+        }
         if let Some(aka) = a.get("aka") {
             spec.insert("aka".into(), aka.clone());
         }
@@ -440,7 +466,7 @@ impl SpriteServer {
         spec.insert("prims".into(), a.get("prims").cloned().unwrap_or(json!([])));
         let mut v = Value::Object(spec);
         // validate + render before touching the library
-        let mut res = render_result(&v, "", 8)?;
+        let mut res = render_result(&v, "", None)?;
         let expect = existing.as_ref().map(store::rev_of);
         let rev = self.commit(name, &mut v, expect, if on_disk.is_some() { "overwrite" } else { "create" }, who)?;
         let mut head = format!("Created \"{name}\" (rev {rev}).");
@@ -463,6 +489,16 @@ impl SpriteServer {
             }
         }
         let o = v.as_object_mut().ok_or("stored spec is not an object")?;
+        if let Some(size) = a.get("size").filter(|x| !x.is_null()) {
+            let old = o.get("size").and_then(Value::as_u64).unwrap_or(32);
+            if size.as_u64() != Some(old) && a.get("prims").is_none() {
+                return Err(format!(
+                    "Changing size from {old} to {size} doesn't move or resize any shapes (coordinates are canvas pixels). \
+                     Send prims redrawn for the new canvas along with size. Nothing was changed."
+                ));
+            }
+            o.insert("size".into(), size.clone());
+        }
         for k in ["anim", "tracks", "aka", "prims"] {
             if let Some(x) = a.get(k) {
                 o.insert(k.into(), x.clone());
@@ -511,7 +547,7 @@ impl SpriteServer {
                 }
             }
         }
-        let mut res = render_result(&v, "", 8)?;
+        let mut res = render_result(&v, "", None)?;
         let rev = self.commit(name, &mut v, Some(base_rev), "edit", who)?;
         set_headline(&mut res, &format!("Updated \"{name}\" (rev {rev})."));
         Ok(res)
@@ -554,7 +590,7 @@ impl SpriteServer {
         }
         let rev = a.get("rev").and_then(Value::as_u64).ok_or("rev is required")?;
         let mut v = store::load_rev(&self.lib, n, rev)?;
-        let mut res = render_result(&v, "", 8)?;
+        let mut res = render_result(&v, "", None)?;
         let on_disk = std::fs::read(self.path(n)).ok();
         let current = on_disk.as_deref().and_then(|b| serde_json::from_slice::<Value>(b).ok()).map(|v| store::rev_of(&v));
         // commit refuses if the sprite was saved, deleted or recreated since we read `current`
@@ -575,8 +611,8 @@ impl SpriteServer {
         let v = self.load(name)?;
         let (spec, frames) = render_spec(&v).map_err(|e| format!("\"{name}\" has an invalid spec:\n- {}", e.join("\n- ")))?;
         let scale = match a.get("scale") {
-            None | Some(Value::Null) => 8,
-            Some(v) => v.as_u64().filter(|s| (1..=16).contains(s)).ok_or("scale must be a whole number from 1 to 16")? as usize,
+            None | Some(Value::Null) => preview_scale(spec.size, None)?,
+            Some(v) => preview_scale(spec.size, Some(v.as_u64().ok_or("scale must be a whole number")?))?,
         };
         let bg_arg = arg_str(a, "bg").unwrap_or("transparent");
         let bg = imgio::parse_bg(bg_arg)?;
@@ -632,7 +668,12 @@ impl SpriteServer {
         }
         let mut content = vec![];
         if gif.len() <= MAX_INLINE_GIF {
-            content.push(ContentBlock::image(base64::engine::general_purpose::STANDARD.encode(&gif), "image/gif"));
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&gif);
+            content.push(ContentBlock::image(b64.clone(), "image/gif"));
+            // the same bytes as a file resource, so a client can save the actual GIF
+            content.push(ContentBlock::resource(
+                ResourceContents::blob(b64, format!("sprite://{name}.gif")).with_mime_type("image/gif"),
+            ));
         } else {
             lines.push(format!(
                 "At {:.0} KB it's too big to return inline (limit {} KB); use the URL, or a smaller scale or fewer frames.",
@@ -928,7 +969,7 @@ impl ServerHandler for SpriteServer {
                     "export_gif" => this.export_gif(&args, privileged),
                     "render_sprite" => {
                         let n = arg_str(&args, "name").unwrap_or_default();
-                        let scale = args.get("scale").and_then(Value::as_u64).unwrap_or(8).clamp(1, 16) as usize;
+                        let scale = args.get("scale").and_then(Value::as_u64);
                         this.load(n).and_then(|v| render_result(&v, &format!("\"{n}\""), scale))
                     }
                     _ => this.export_atlas(&args),

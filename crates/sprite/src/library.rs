@@ -2,7 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
-use sprite_core::{Frame, SIZE};
+use sprite_core::Frame;
 use std::path::{Path, PathBuf};
 
 use crate::imgio::{self, Rgba};
@@ -57,15 +57,19 @@ pub const ATLAS_SIDE_LIMIT: usize = 8192;
 
 /// Pack every frame of every sprite into one PNG + a Phaser/Pixi JSON-hash frame map.
 ///
-/// Frames are packed into a near-square grid of SIZE×scale cells: each sprite's frames sit in a
-/// run left to right (wrapping onto a new row only if the run is longer than a row), and frames
+/// Each frame gets a cell of its canvas size × scale, so a 64px sprite's cells are twice as wide
+/// as a 32px one's. Cells are shelf-packed into a near-square sheet: each sprite's frames sit in a
+/// run left to right (wrapping onto a new row only if the run is longer than a row), and a row is
+/// as tall as its tallest cell. When every sprite is the same size this is a plain grid. Frames
 /// that are pixel-identical — a still sprite, a hold pose — share one cell, so the frame map can
 /// point several keys at the same rectangle. Returns an error, before allocating anything, if
 /// the result would be wider or taller than `max_side` px.
 pub fn atlas(sprites: &[(Value, Vec<Frame>)], scale: usize, image_name: &str, max_side: usize) -> Result<(Rgba, Value)> {
     let scale = scale.max(1);
-    let cell = SIZE * scale;
-    let max_cols = (max_side / cell).max(1);
+    let cell_of = |fr: &[Frame]| fr.first().map_or(sprite_core::SIZE, Frame::size) * scale;
+    // width is measured in units of the smallest cell, which every other cell is a multiple of
+    let unit = sprites.iter().map(|(_, fr)| cell_of(fr)).min().unwrap_or(sprite_core::SIZE * scale);
+    let max_cols = (max_side / unit).max(1);
     // unique frames per sprite, and for each frame which unique cell it uses
     let mut uniq: Vec<(Vec<&Frame>, Vec<usize>)> = Vec::with_capacity(sprites.len());
     for (_, fr) in sprites {
@@ -81,31 +85,35 @@ pub fn atlas(sprites: &[(Value, Vec<Frame>)], scale: usize, image_name: &str, ma
         uniq.push((cells, map));
     }
     let total: usize = uniq.iter().map(|u| u.0.len()).sum();
-    let longest = uniq.iter().map(|u| u.0.len()).max().unwrap_or(1);
+    // in units: a cell k units wide covers k×k units of area
+    let units = |(_, fr): &(Value, Vec<Frame>)| cell_of(fr) / unit;
+    let area: usize = sprites.iter().zip(&uniq).map(|(sp, u)| units(sp) * units(sp) * u.0.len()).sum();
+    let longest = sprites.iter().zip(&uniq).map(|(sp, u)| units(sp) * u.0.len()).max().unwrap_or(1);
+    let widest = sprites.iter().map(units).max().unwrap_or(1);
     // square-ish, but at least one sprite's whole run per row when it fits
-    let cols = ((total as f64).sqrt().ceil() as usize).max(longest).clamp(1, max_cols);
-    // place runs (shelf packing on a fixed grid)
-    let (mut cx, mut cy) = (0usize, 0usize);
+    let cols = ((area as f64).sqrt().ceil() as usize).max(longest).clamp(widest.min(max_cols), max_cols.max(widest));
+    // place runs (shelf packing): (x, y) in px of each unique cell
+    let row_w = cols * unit;
+    let (mut cx, mut cy, mut row_h) = (0usize, 0usize, 0usize);
     let mut placed: Vec<Vec<(usize, usize)>> = Vec::with_capacity(uniq.len());
-    for (cells, _) in &uniq {
-        let run = cells.len();
-        if cx > 0 && cx + run > cols && run <= cols {
-            cx = 0;
-            cy += 1;
+    for ((_, fr), (cells, _)) in sprites.iter().zip(&uniq) {
+        let cell = cell_of(fr);
+        let run = cells.len() * cell;
+        if cx > 0 && cx + run > row_w && run <= row_w {
+            (cx, cy, row_h) = (0, cy + row_h, 0);
         }
-        let mut at = Vec::with_capacity(run);
-        for _ in 0..run {
-            if cx == cols {
-                cx = 0;
-                cy += 1;
+        let mut at = Vec::with_capacity(cells.len());
+        for _ in 0..cells.len() {
+            if cx + cell > row_w {
+                (cx, cy, row_h) = (0, cy + row_h, 0);
             }
             at.push((cx, cy));
-            cx += 1;
+            cx += cell;
+            row_h = row_h.max(cell);
         }
         placed.push(at);
     }
-    let rows = if cx == 0 { cy } else { cy + 1 }.max(1);
-    let (w, h) = (cols * cell, rows * cell);
+    let (w, h) = (row_w, (cy + row_h).max(unit));
     if w > max_side || h > max_side {
         bail!(
             "{} sprites ({total} distinct frames) need a {w}×{h}px atlas at scale {scale}, over the {max_side}px limit \
@@ -118,14 +126,15 @@ pub fn atlas(sprites: &[(Value, Vec<Frame>)], scale: usize, image_name: &str, ma
     let mut anims = serde_json::Map::new();
     for (((spec, fr), (cells, map)), at) in sprites.iter().zip(&uniq).zip(&placed) {
         let name = spec_name(spec);
+        let cell = cell_of(fr);
         for (c, &(x, y)) in cells.iter().zip(at) {
-            img.blit_frame(c, x * cell, y * cell, scale);
+            img.blit_frame(c, x, y, scale);
         }
         let mut keys = Vec::with_capacity(fr.len());
         for (k, &u) in map.iter().enumerate() {
             let (x, y) = at[u];
             let key = format!("{name}_{k}");
-            frames.insert(key.clone(), json!({"frame": {"x": x * cell, "y": y * cell, "w": cell, "h": cell}}));
+            frames.insert(key.clone(), json!({"frame": {"x": x, "y": y, "w": cell, "h": cell}, "sourceSize": {"w": cell, "h": cell}}));
             keys.push(key);
         }
         anims.insert(
@@ -135,11 +144,16 @@ pub fn atlas(sprites: &[(Value, Vec<Frame>)], scale: usize, image_name: &str, ma
                 "frameMs": spec.get("ms").and_then(Value::as_u64).unwrap_or(110),
                 "durations": frame_durations(spec, fr.len()),
                 "category": spec.get("cat"),
+                "size": cell / scale,
             }),
         );
     }
+    // spriteSize is the one cell size when every sprite shares it; with mixed sizes read each
+    // frame's w/h (or the animation's size) instead
+    let sizes: std::collections::BTreeSet<usize> = sprites.iter().map(|(_, fr)| cell_of(fr)).collect();
+    let sprite_size = if sizes.len() == 1 { json!(sizes.first()) } else { Value::Null };
     let meta = json!({
-        "meta": {"image": image_name, "size": {"w": img.w, "h": img.h}, "scale": scale, "spriteSize": cell},
+        "meta": {"image": image_name, "size": {"w": img.w, "h": img.h}, "scale": scale, "spriteSize": sprite_size},
         "frames": frames,
         "animations": anims,
     });
@@ -147,12 +161,14 @@ pub fn atlas(sprites: &[(Value, Vec<Frame>)], scale: usize, image_name: &str, ma
 }
 
 pub fn save_sprite_outputs(dir: &Path, name: &str, frames: &[Frame], durations: &[u32]) -> Result<()> {
-    let mut first = Rgba::new(SIZE, SIZE);
+    let side = frames[0].size();
+    let mut first = Rgba::new(side, side);
     first.blit_frame(&frames[0], 0, 0, 1);
     imgio::write(&dir.join(format!("{name}.png")), &first.png()?)?;
     imgio::write(&dir.join(format!("{name}_sheet.png")), &Rgba::strip(frames).png()?)?;
     if frames.len() > 1 {
-        let (gif, _) = imgio::gif(frames, durations, &imgio::GifOpts { scale: 6, ..Default::default() })?;
+        // 192px at 32, the same footprint at bigger canvases
+        let (gif, _) = imgio::gif(frames, durations, &imgio::GifOpts { scale: (192 / side).max(1), ..Default::default() })?;
         imgio::write(&dir.join(format!("{name}.gif")), &gif)?;
     }
     Ok(())
@@ -206,6 +222,45 @@ mod tests {
         let used = distinct.len() + 2;
         assert!(img.w * img.h <= (used + img.w / 64) * 64 * 64, "{}×{} for {used} cells", img.w, img.h);
         assert_eq!(meta["animations"]["ball"]["frames"].as_array().unwrap().len(), 8);
+    }
+
+    #[test]
+    fn mixed_canvas_sizes_pack_without_overlap() {
+        let sized = |name: &str, size: usize, anim: &str| {
+            let h = size as f64 / 2.0;
+            let v = json!({"name": name, "size": size, "anim": anim, "prims": [{"t": "ellipse", "c": [h, h], "r": h * 0.6, "m": "red"}]});
+            let (_, f) = sprite_core::render_json(&v).unwrap();
+            (v, f)
+        };
+        let set = [sized("a", 32, "wobble"), sized("b", 128, "none"), sized("c", 64, "bob"), sized("d", 32, "none")];
+        let (img, meta) = atlas(&set, 1, "a.png", ATLAS_MAX_SIDE).unwrap();
+        let rects: Vec<(String, [u64; 4])> = meta["frames"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| {
+                let f = &v["frame"];
+                (k.clone(), [f["x"].as_u64().unwrap(), f["y"].as_u64().unwrap(), f["w"].as_u64().unwrap(), f["h"].as_u64().unwrap()])
+            })
+            .collect();
+        for (k, r) in &rects {
+            let want = match &k[..1] { "b" => 128, "c" => 64, _ => 32 };
+            assert_eq!((r[2], r[3]), (want, want), "{k}");
+            assert!(r[0] + r[2] <= img.w as u64 && r[1] + r[3] <= img.h as u64, "{k} inside the image");
+        }
+        // distinct cells never overlap
+        for (i, (ka, a)) in rects.iter().enumerate() {
+            for (kb, b) in &rects[i + 1..] {
+                let overlap = a[0] < b[0] + b[2] && b[0] < a[0] + a[2] && a[1] < b[1] + b[3] && b[1] < a[1] + a[3];
+                assert!(!overlap || a == b, "{ka} {a:?} overlaps {kb} {b:?}");
+            }
+        }
+        assert_eq!(meta["animations"]["b"]["size"], 128);
+        assert!(meta["meta"]["spriteSize"].is_null());
+        // the pixels landed where the map says: b's centre is opaque
+        let b = rects.iter().find(|(k, _)| k == "b_0").unwrap().1;
+        let (cx, cy) = ((b[0] + 64) as usize, (b[1] + 64) as usize);
+        assert_eq!(img.px[(cy * img.w + cx) * 4 + 3], 255);
     }
 
     #[test]

@@ -10,22 +10,39 @@ pub type Pt = [f64; 2];
 
 /// Hard limits on what one spec may ask the renderer to do. Specs arrive from models and over
 /// HTTP, so anything that scales memory or time (smoothing doubles points per pass, `n` sets the
-/// vertex count, px stamps are grouped pairwise) is bounded here rather than trusted. The ranges
-/// are several times what real sprites use.
+/// vertex count) is bounded here rather than trusted. The ranges are several times what real
+/// sprites use. Constants are for the default 32px canvas; the functions scale them with `size`.
 pub mod limits {
+    /// canvas sizes a spec may choose
+    pub const SIZES: [usize; 3] = [32, 64, 128];
     pub const MAX_PRIMS: usize = 64;
     pub const MAX_TRACKS: usize = 16;
-    /// points in one poly / line / px prim
+    /// points in one poly / line / px prim at 32px (× size/32)
     pub const MAX_PTS: usize = 256;
-    /// px points across the whole spec
+    /// px points across the whole spec at 32px (× (size/32)², since px cover area)
     pub const MAX_PX_PTS: usize = 1024;
     pub const MAX_SMOOTH: f64 = 4.0;
     /// sides of an ngon / points of a star
     pub const MAX_N: f64 = 64.0;
-    /// coordinates (c, p, pts, pivot) may sit a canvas off either side, no further
+    /// coordinates (c, p, pts, pivot) may sit a canvas off either side, no further (at 32px)
     pub const COORD: (f64, f64) = (-64.0, 96.0);
-    /// radii, widths, puff, rounding
+    /// radii, widths, puff, rounding, dx/dy amplitude (at 32px)
     pub const SIZE: f64 = 64.0;
+
+    /// The 32px limits scaled to a `size` canvas.
+    #[derive(Debug, Clone, Copy)]
+    pub struct Scaled {
+        pub coord: (f64, f64),
+        pub size: f64,
+        pub pts: usize,
+        pub px_pts: usize,
+    }
+
+    pub fn for_size(size: usize) -> Scaled {
+        let u = size / 32;
+        let f = u as f64;
+        Scaled { coord: (COORD.0 * f, COORD.1 * f), size: SIZE * f, pts: MAX_PTS * u, px_pts: MAX_PX_PTS * u * u }
+    }
     pub const MAX_WEIGHT: f64 = 16.0;
     pub const MAX_HEIGHT: f64 = 16.0;
     pub const MAX_ANGLE: f64 = 3600.0;
@@ -144,6 +161,8 @@ pub struct Track {
 #[derive(Debug, Clone)]
 pub struct Spec {
     pub name: String,
+    /// canvas side in px: 32 (default), 64 or 128. Coordinates are in these pixels.
+    pub size: usize,
     pub cat: Option<String>,
     pub anim: String,
     pub frames: usize,
@@ -191,8 +210,8 @@ fn within(errs: &mut Vec<String>, at: &str, k: &str, v: f64, lo: f64, hi: f64) {
 }
 
 /// Bounds-check every coordinate of a prim: `c`, `p`, every point.
-fn coords_within(errs: &mut Vec<String>, at: &str, o: &Map<String, Value>, pts: &[Pt]) {
-    let (lo, hi) = limits::COORD;
+fn coords_within(errs: &mut Vec<String>, at: &str, o: &Map<String, Value>, pts: &[Pt], lim: &limits::Scaled) {
+    let (lo, hi) = lim.coord;
     let mut bad = |k: &str, v: f64| {
         if !(v.is_finite() && (lo..=hi).contains(&v)) {
             errs.push(format!("{at}{k} has a coordinate {v} outside {lo}..{hi}"));
@@ -226,6 +245,14 @@ impl Spec {
             None => return Err(vec!["spec must be a JSON object".into()]),
         };
         let name = o.get("name").and_then(Value::as_str).unwrap_or("sprite").to_string();
+        let size = match o.get("size") {
+            None | Some(Value::Null) => 32,
+            Some(v) => match v.as_f64() {
+                Some(x) if limits::SIZES.iter().any(|&s| s as f64 == x) => x as usize,
+                _ => return Err(vec![format!("size must be one of {:?} (got {v})", limits::SIZES)]),
+            },
+        };
+        let lim = limits::for_size(size);
         let anim = o.get("anim").and_then(Value::as_str).unwrap_or("none").to_string();
         if !crate::anim::PRESET_NAMES.contains(&anim.as_str()) {
             errs.push(format!("unknown anim {anim:?} (use one of {:?})", crate::anim::PRESET_NAMES));
@@ -245,12 +272,12 @@ impl Spec {
             .filter(|p| p.get("t").and_then(Value::as_str) == Some("px"))
             .filter_map(|p| p.get("pts").and_then(Value::as_array).map(Vec::len))
             .sum();
-        if px_pts > limits::MAX_PX_PTS {
-            errs.push(format!("px prims have {px_pts} points in total; at most {} — draw large areas with shapes", limits::MAX_PX_PTS));
+        if px_pts > lim.px_pts {
+            errs.push(format!("px prims have {px_pts} points in total; at most {} at size {size} — draw large areas with shapes", lim.px_pts));
         }
         let mut prims = Vec::with_capacity(prims_v.len());
         for (i, pv) in prims_v.iter().enumerate() {
-            match parse_prim(pv, i, pal) {
+            match parse_prim(pv, i, pal, size, &lim) {
                 Ok(p) => prims.push(p),
                 Err(e) => errs.extend(e),
             }
@@ -261,7 +288,7 @@ impl Spec {
                 errs.push(format!("a sprite can have at most {} tracks (got {})", limits::MAX_TRACKS, arr.len()));
             }
             for (k, tv) in arr.iter().enumerate().take(limits::MAX_TRACKS) {
-                match parse_track(tv) {
+                match parse_track(tv, &lim) {
                     Ok(t) => {
                         if let Some(g) = &t.g {
                             if !prims_v.iter().any(|p| p.get("g").and_then(Value::as_str) == Some(g)) {
@@ -315,6 +342,7 @@ impl Spec {
         }
         Ok(Spec {
             name,
+            size,
             cat: o.get("cat").and_then(Value::as_str).map(str::to_string),
             anim,
             frames,
@@ -339,7 +367,7 @@ impl Spec {
     }
 }
 
-fn parse_prim(v: &Value, i: usize, pal: &Palette) -> Result<Prim, Vec<String>> {
+fn parse_prim(v: &Value, i: usize, pal: &Palette, size: usize, lim: &limits::Scaled) -> Result<Prim, Vec<String>> {
     let mut errs = Vec::new();
     let o = match v.as_object() {
         Some(o) => o,
@@ -358,7 +386,8 @@ fn parse_prim(v: &Value, i: usize, pal: &Palette) -> Result<Prim, Vec<String>> {
         errs.push(format!("prims[{i}]: unknown material {mname:?}"));
         0
     });
-    let c = o.get("c").and_then(pt).unwrap_or([16.0, 16.0]);
+    let mid = size as f64 / 2.0;
+    let c = o.get("c").and_then(pt).unwrap_or([mid, mid]);
     let r = match o.get("r") {
         Some(Value::Number(n)) => {
             let x = n.as_f64().unwrap_or(1.0);
@@ -390,18 +419,18 @@ fn parse_prim(v: &Value, i: usize, pal: &Palette) -> Result<Prim, Vec<String>> {
         _ => {}
     }
     let at = format!("prims[{i}]: ");
-    if pts_v.len() > limits::MAX_PTS {
-        errs.push(format!("{at}pts has {} points; at most {}", pts_v.len(), limits::MAX_PTS));
+    if pts_v.len() > lim.pts {
+        errs.push(format!("{at}pts has {} points; at most {}", pts_v.len(), lim.pts));
     }
-    coords_within(&mut errs, &at, o, &pts_v);
+    coords_within(&mut errs, &at, o, &pts_v, lim);
     if let Some(Value::Array(a)) = o.get("r") {
         for v in a.iter().filter_map(Value::as_f64) {
-            within(&mut errs, &at, "r", v, 0.0, limits::SIZE);
+            within(&mut errs, &at, "r", v, 0.0, lim.size);
         }
     }
     for k in ["r", "r2", "w", "puff", "round"] {
         if let Some(v) = num(o, k) {
-            within(&mut errs, &at, k, v, 0.0, limits::SIZE);
+            within(&mut errs, &at, k, v, 0.0, lim.size);
         }
     }
     for (k, hi) in [("smooth", limits::MAX_SMOOTH), ("weight", limits::MAX_WEIGHT), ("height", limits::MAX_HEIGHT)] {
@@ -464,7 +493,7 @@ fn parse_prim(v: &Value, i: usize, pal: &Palette) -> Result<Prim, Vec<String>> {
     })
 }
 
-fn parse_track(v: &Value) -> Result<Track, String> {
+fn parse_track(v: &Value, lim: &limits::Scaled) -> Result<Track, String> {
     let o = v.as_object().ok_or("must be an object")?;
     let g = match o.get("g").and_then(Value::as_str) {
         None | Some("*") => None,
@@ -497,7 +526,7 @@ fn parse_track(v: &Value) -> Result<Track, String> {
         },
         Some(v) => {
             let p = pt(v).ok_or("pivot must be a name or [x,y]")?;
-            let (lo, hi) = limits::COORD;
+            let (lo, hi) = lim.coord;
             if !p.iter().all(|c| (lo..=hi).contains(c)) {
                 return Err(format!("pivot must lie within {lo}..{hi}"));
             }
@@ -507,7 +536,7 @@ fn parse_track(v: &Value) -> Result<Track, String> {
     let amp = num(o, "amp").ok_or("amp is required")?;
     let amp_max = match prop {
         Prop::Rot => limits::MAX_ANGLE,
-        Prop::Dx | Prop::Dy => limits::SIZE,
+        Prop::Dx | Prop::Dy => lim.size,
         Prop::Sx | Prop::Sy => limits::MAX_SCALE_AMP,
     };
     if !(amp.is_finite() && amp.abs() <= amp_max) {

@@ -28,8 +28,16 @@ from PIL import Image, ImageDraw, ImageFont
 from scipy import ndimage
 
 # ─────────────────────────── style spec (owned by "designers") ───────────────────────────
-SIZE = 32          # output canvas (px)
-SS = 8             # supersampling factor
+SIZE = 32          # default output canvas (px); a spec's "size" may be 64 or 128
+SS = 8             # supersampling factor at 32px (4 at 64, 2 at 128, so the supersampled grid stays 256px)
+SIZES = (32, 64, 128)
+
+
+def spec_size(spec):
+    s = spec.get("size", SIZE)
+    if s not in SIZES:
+        raise ValueError(f"size must be one of {SIZES}, not {s!r}")
+    return s
 FRAMES = 8         # frames per animation
 LIGHT = np.array([-0.55, -0.75, 0.95])
 LIGHT = LIGHT / np.linalg.norm(LIGHT)
@@ -258,7 +266,10 @@ def frame_transforms(spec, t):
     Track fields: g (group or '*'), prop (dx|dy|rot|sx|sy), amp, wave (sin|abs|abs2|saw|square),
     phase (0-1), pivot ('center'|'bottom'|'top'|[x,y]|'each' = every member around its own centre).
     """
-    tracks = list(PRESETS.get(spec.get("anim", "none"), []))
+    # presets are written for 32px; their pixel moves scale with the canvas
+    u = spec_size(spec) / SIZE
+    tracks = [dict(tr, amp=tr["amp"] * u) if tr["prop"] in ("dx", "dy") else tr
+              for tr in PRESETS.get(spec.get("anim", "none"), [])]
     tracks += spec.get("tracks", [])
     prims = spec["prims"]
     G = np.eye(3)
@@ -301,10 +312,16 @@ def _shade_from_normals(nx, ny, nz, gloss):
 
 
 def render_frame(spec, t=0.0):
-    """Render one frame → (H,W,4) uint8 RGBA at SIZE."""
+    """Render one frame → (S,S,4) uint8 RGBA, S = the spec's canvas size.
+
+    Coordinates are canvas px. Supersampling drops as the canvas grows, so the 1.2px blur below
+    is always 0.15 px of a 32px sprite scaled by size/32: shapes drawn at 2x on a 64px canvas
+    shade like the 32px ones, only crisper."""
+    S = spec_size(spec)
+    ss = max(2, SS * SIZE // S)
     prims = spec["prims"]
     pm = frame_transforms(spec, t)
-    N = SIZE * SS
+    N = S * ss
     label = np.zeros((N, N), np.int32)       # 0 = empty; else prim_index+1
     shade = np.zeros((N, N), np.int8)
     weights = []
@@ -317,14 +334,14 @@ def render_frame(spec, t=0.0):
         if p.get("rot"):
             M = M @ _affine(rot=p["rot"], pivot=ctr)
         if p.get("flipx"):
-            M = M @ _affine(sx=-1, pivot=(16, 16))
-        pts = _apply(M, pts) * SS
+            M = M @ _affine(sx=-1, pivot=(S / 2, S / 2))
+        pts = _apply(M, pts) * ss
         img = Image.new("L", (N, N), 0)
         dr = ImageDraw.Draw(img)
         if kind == "poly":
             dr.polygon([tuple(q) for q in pts], fill=255)
         else:
-            ww = max(1, int(round(w * SS)))
+            ww = max(1, int(round(w * ss)))
             dr.line([tuple(q) for q in pts], fill=255, width=ww, joint="curve")
             if p.get("cap", True):
                 rr = ww / 2
@@ -351,10 +368,10 @@ def render_frame(spec, t=0.0):
         else:
             dist = ndimage.distance_transform_edt(mask)
             ys, xs = np.nonzero(mask)
-            bw = (xs.max() - xs.min() + 1) / SS
-            bh = (ys.max() - ys.min() + 1) / SS
+            bw = (xs.max() - xs.min() + 1) / ss
+            bh = (ys.max() - ys.min() + 1) / ss
             puff = p.get("puff", min(bw, bh) / 2)
-            R = max(1.0, puff * SS)
+            R = max(1.0, puff * ss)
             x = np.clip(dist / R, 0, 1)
             h = R * np.sqrt(np.clip(1 - (1 - x) ** 2, 0, 1)) * p.get("height", 1.0)
             h = ndimage.gaussian_filter(h, 1.2)
@@ -367,14 +384,14 @@ def render_frame(spec, t=0.0):
         shade[mask] = sh[mask]
     # ── weighted-mode downsample
     combo = np.where(label > 0, label * 8 + shade.astype(np.int32), 0)
-    blocks = combo.reshape(SIZE, SS, SIZE, SS).transpose(0, 2, 1, 3).reshape(SIZE * SIZE, SS * SS)
+    blocks = combo.reshape(S, ss, S, ss).transpose(0, 2, 1, 3).reshape(S * S, ss * ss)
     wvec = np.ones(len(prims) + 2)
     for i, p in enumerate(prims):
         wvec[i + 1] = p.get("weight", 1.0)
-    out_lab = np.zeros(SIZE * SIZE, np.int32)
-    out_sh = np.zeros(SIZE * SIZE, np.int8)
-    cov_need = SS * SS * 0.42
-    for b in range(SIZE * SIZE):
+    out_lab = np.zeros(S * S, np.int32)
+    out_sh = np.zeros(S * S, np.int8)
+    cov_need = ss * ss * 0.42
+    for b in range(S * S):
         row = blocks[b]
         nz_ = row[row > 0]
         if len(nz_) == 0:
@@ -382,7 +399,7 @@ def render_frame(spec, t=0.0):
         labs = nz_ // 8
         # thin features: if a high-weight prim is present at all, let it compete with full coverage
         heavy = wvec[labs] > 1.5
-        if len(nz_) < cov_need and not (heavy.sum() >= SS * SS * 0.18):
+        if len(nz_) < cov_need and not (heavy.sum() >= ss * ss * 0.18):
             continue
         vals, counts = np.unique(nz_, return_counts=True)
         score = counts * wvec[vals // 8]
@@ -390,14 +407,14 @@ def render_frame(spec, t=0.0):
         best = vals[np.argmax(score + (vals // 8) * 1e-3)]
         out_lab[b] = best // 8
         out_sh[b] = best % 8
-    lab = out_lab.reshape(SIZE, SIZE)
-    sh = out_sh.reshape(SIZE, SIZE)
+    lab = out_lab.reshape(S, S)
+    sh = out_sh.reshape(S, S)
 
     # ── cleanup: remove lone shade pixels inside a single prim
     for _ in range(1):
         new = sh.copy()
-        for y in range(1, SIZE - 1):
-            for x in range(1, SIZE - 1):
+        for y in range(1, S - 1):
+            for x in range(1, S - 1):
                 if lab[y, x] == 0:
                     continue
                 nb = [(y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)]
@@ -410,14 +427,14 @@ def render_frame(spec, t=0.0):
 
     # ── internal edge lines: lower prim pixels touching an `edge` prim get a dark line
     edge_px = []
-    for y in range(SIZE):
-        for x in range(SIZE):
+    for y in range(S):
+        for x in range(S):
             li = lab[y, x]
             if li == 0:
                 continue
             for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
                 yy, xx = y + dy, x + dx
-                if 0 <= yy < SIZE and 0 <= xx < SIZE:
+                if 0 <= yy < S and 0 <= xx < S:
                     lj = lab[yy, xx]
                     if lj > li and prims[lj - 1].get("edge"):
                         edge_px.append((y, x))
@@ -426,9 +443,9 @@ def render_frame(spec, t=0.0):
         sh[y, x] = 0
 
     # ── colourize
-    rgba = np.zeros((SIZE, SIZE, 4), np.uint8)
-    for y in range(SIZE):
-        for x in range(SIZE):
+    rgba = np.zeros((S, S, 4), np.uint8)
+    for y in range(S):
+        for x in range(S):
             li = lab[y, x]
             if li == 0:
                 continue
@@ -444,7 +461,7 @@ def render_frame(spec, t=0.0):
         col = PALETTE[p.get("m", "black")][p.get("shade", 1)]
         for qx, qy in pts:
             xi, yi = int(math.floor(qx)), int(math.floor(qy))
-            if 0 <= xi < SIZE and 0 <= yi < SIZE:
+            if 0 <= xi < S and 0 <= yi < S:
                 rgba[yi, xi, :3] = col
                 rgba[yi, xi, 3] = 255
                 if lab[yi, xi] == 0:
@@ -453,14 +470,14 @@ def render_frame(spec, t=0.0):
     # ── selective outer outline (4-neighbour), colour = darkest step of neighbour material
     opaque = rgba[:, :, 3] > 0
     outline = np.zeros_like(opaque)
-    oc = np.zeros((SIZE, SIZE, 3), np.uint8)
-    for y in range(SIZE):
-        for x in range(SIZE):
+    oc = np.zeros((S, S, 3), np.uint8)
+    for y in range(S):
+        for x in range(S):
             if opaque[y, x]:
                 continue
             for dy, dx in ((1, 0), (0, 1), (-1, 0), (0, -1)):
                 yy, xx = y + dy, x + dx
-                if 0 <= yy < SIZE and 0 <= xx < SIZE and opaque[yy, xx]:
+                if 0 <= yy < S and 0 <= xx < S and opaque[yy, xx]:
                     li = lab[yy, xx]
                     m = prims[li - 1].get("m", "gray") if 0 < li <= len(prims) else "black"
                     if prims[li - 1].get("t") == "px" if 0 < li <= len(prims) else False:
@@ -488,6 +505,11 @@ def upscale(rgba, k):
     return np.kron(rgba, np.ones((k, k, 1), np.uint8))
 
 
+def display_scale(frame, scale):
+    """Upscale that shows a frame at the size a 32px sprite gets at `scale`."""
+    return max(1, SIZE * scale // frame.shape[0])
+
+
 def save_outputs(spec, outdir: Path, scale=6):
     outdir.mkdir(parents=True, exist_ok=True)
     name = spec["name"]
@@ -496,7 +518,7 @@ def save_outputs(spec, outdir: Path, scale=6):
     strip = np.concatenate(frames, axis=1)
     Image.fromarray(strip, "RGBA").save(outdir / f"{name}_sheet.png")
     if len(frames) > 1:
-        imgs = [Image.fromarray(upscale(f, scale), "RGBA") for f in frames]
+        imgs = [Image.fromarray(upscale(f, display_scale(f, scale)), "RGBA") for f in frames]
         imgs[0].save(outdir / f"{name}.gif", save_all=True, append_images=imgs[1:],
                      duration=spec.get("ms", 110), loop=0, disposal=2, transparency=0)
     return frames
@@ -517,7 +539,7 @@ def contact_sheet(specs, path: Path, scale=4, cols=10, frame_idx=0, bg=(236, 232
     for k, spec in enumerate(specs):
         fr = render_anim(spec)
         f = fr[min(frame_idx, len(fr) - 1)]
-        img = Image.fromarray(upscale(f, scale), "RGBA")
+        img = Image.fromarray(upscale(f, display_scale(f, scale)), "RGBA")
         cx, cy = (k % cols) * cell, (k // cols) * (cell + lab_h)
         # checker to reveal transparency/outline
         dr.rectangle([cx + 4, cy + 4, cx + 4 + SIZE * scale - 1, cy + 4 + SIZE * scale - 1], fill=(250, 248, 242))
@@ -537,7 +559,7 @@ def strip_sheet(specs, path: Path, scale=4, bg=(236, 232, 224)):
     for r, (name, frames) in enumerate(rows):
         dr.text((4, r * cw + cw // 2 - 6), name, fill=(40, 40, 50))
         for k, f in enumerate(frames):
-            img = Image.fromarray(upscale(f, scale), "RGBA")
+            img = Image.fromarray(upscale(f, display_scale(f, scale)), "RGBA")
             x, y = 90 + k * cw, r * cw + 2
             dr.rectangle([x, y, x + SIZE * scale - 1, y + SIZE * scale - 1], fill=(250, 248, 242))
             sheet.paste(img, (x, y), img)

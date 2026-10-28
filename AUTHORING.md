@@ -5,19 +5,39 @@ Never hand-pick RGB colours or draw shading yourself — pick a material and let
 fixed top-left light produce the shading.
 
 ## Canvas & style rules
-- Canvas is **32×32**, coordinates are floats, origin top-left, y grows DOWN.
-- Keep everything inside **x,y ∈ [1.5, 30.5]** — the renderer adds a 1px outline around the silhouette.
-- **Fill the canvas**: the subject should span ~26–29px on its longest axis. Small sprites look sad.
-- Upright things (animals, people-ish, furniture, buildings, vehicles) rest on the bottom: lowest point ≈ y 29.5–30.
+- Canvas is **32×32** by default. Set `"size": 64` or `"size": 128` for more detail in the same style.
+  Coordinates are floats in the canvas's own pixels (0–64 on a 64 canvas, not 0–32), origin top-left, y grows DOWN.
+- Keep everything inside **x,y ∈ [1.5, size − 1.5]** — the renderer adds a 1px outline around the silhouette.
+- **Fill the canvas**: the subject should span ~26–29px of a 32 canvas on its longest axis (52–58 at 64,
+  104–116 at 128). Small sprites look sad.
+- Upright things (animals, people-ish, furniture, buildings, vehicles) rest on the bottom: lowest point ≈ y = size − 2.
 - Pick the most iconic, instantly-readable view for a 4–6 year old:
   side view for most animals & vehicles (facing **right**), front view where the face is the point (owl, cat).
 - Faces (eyes) ONLY on animals. No faces on food or objects.
-- Eyes: single `px` pixels (`"m":"black","shade":0`), usually 1×1 or 1×2. A white glint is optional.
-- Minimum readable feature ≈ 1.5px wide. Thinner things vanish unless you give them `"weight": 3`
-  or draw them as `px` pixels.
-- Fewer, bigger shapes beat many tiny ones. Typical sprite: 4–14 primitives.
-- Hard limits (the spec is rejected past these): 64 prims, 256 points per prim, 1024 `px` points in
-  total, `smooth` ≤ 4, `n` 3–64, coordinates within −64…96, and prims × frames ≤ 1024.
+- Eyes: single `px` pixels (`"m":"black","shade":0`), usually 1×1 or 1×2 (2×2 or 2×3 at 64). A white glint is optional.
+- Minimum readable feature ≈ 1.5px wide at 32 (3px at 64, 6px at 128). Thinner things vanish unless
+  you give them `"weight": 3` or draw them as `px` pixels.
+- Fewer, bigger shapes beat many tiny ones. Typical sprite: 4–14 primitives (up to ~35 at 64).
+- Hard limits (the spec is rejected past these): 64 prims, `smooth` ≤ 4, `n` 3–64, prims × frames ≤ 1024, and
+
+  | size | coordinates | radii, widths, puff, dx/dy amp | points per prim | `px` points in total |
+  |---|---|---|---|---|
+  | 32 | −64…96 | ≤ 64 | 256 | 1024 |
+  | 64 | −128…192 | ≤ 128 | 512 | 4096 |
+  | 128 | −256…384 | ≤ 256 | 1024 | 16384 |
+
+### Choosing a canvas size
+- **32** (default): single objects a child names at a glance — fruit, animals, vehicles, furniture.
+- **64**: characters with hands, faces or expressions; props that need a second level of detail
+  (a skateboard with wheels and trucks, sunglasses with glints); scenes with 2–3 parts.
+- **128**: only when 64 is still too cramped — busy characters, small text-like marks, posters.
+  Big canvases take more shapes to fill, and models get sloppier with more coordinates.
+
+Everything else stays the same at every size: the palette, the top-left light, the 5 shading steps,
+a **1px** outline, and 1px `edge` seams. That 1px outline is what keeps a big sprite reading as pixel
+art, so detail comes from more shapes, not thicker lines. Drawing a 32px sprite at 2× coordinates on a
+64 canvas gives the same look, only crisper. Animation presets move proportionally (a `bob` moves
+twice as many pixels at 64); your own `tracks`, pivots, `snap` and `px` stamps are in canvas pixels.
 
 ## Spec format (one JSON array per file, one object per sprite)
 ```json
@@ -42,8 +62,8 @@ fixed top-left light produce the shading.
 
 ## Common fields
 - `m`: material (below). Default gray.
-- `puff`: how rounded the shape is, in px. Default = half the shape's smaller side (fully domed/pillowy).
-  Small values (1–2) = flat face with bevelled edges (walls, books, boxes). Large = round (fruit, bodies).
+- `puff`: how rounded the shape is, in canvas px. Default = half the shape's smaller side (fully domed/pillowy).
+  Small values (1–2 at 32, 2–4 at 64) = flat face with bevelled edges (walls, books, boxes). Large = round (fruit, bodies).
 - `height`: multiplies dome steepness (default 1). <1 flatter shading, >1 stronger.
 - `flat: true` + `shade: 0–4`: no lighting, single tone (windows, stripes, decals, patterns).
 - `tone: -1 | +1`: darken/lighten the whole primitive one step (far-side legs = -1).
@@ -93,7 +113,9 @@ Timing (optional, top level):
   instead of a sub-pixel re-draw. Pair it with `"wave":"square"` or a small `amp` for a crisp bounce.
 
 `export_gif` turns a sprite into an animated GIF using the renderer's exact palette: transparent by
-default, timed from `ms`/`hold`, with optional `bg`, `pingpong` and `repeat`.
+default, timed from `ms`/`hold`, with optional `bg`, `pingpong` and `repeat`. It comes out 256px wide
+by default at every canvas size (scale 8 at 32, 4 at 64, 2 at 128), at most 512px, and is returned as a
+GIF file resource the client can save as well as a preview.
 
 ## Review loop (do this — it's the whole point)
 ```bash
