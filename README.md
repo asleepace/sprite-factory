@@ -73,7 +73,7 @@ so any change can be undone with `restore_sprite`. `edit_sprite` takes `if_rev` 
 newer save. Specs are bounded (prims, points, smoothing, coordinates, prims × frames; see
 `sprite_core::spec::limits`) so a single spec can't exhaust the server.
 `export_gif` returns the animated GIF inline (exact palette, transparent by default) and, when
-`SPRITE_PUBLIC_URL` is set, a download URL for it.
+`SPRITE_PUBLIC_URL` is set, a download URL for it. See `deploy/DEPLOY.md` for which tools need a token.
 
 `blind_review` shows a fresh model an unlabeled, shuffled sheet and grades its guesses against
 each sprite's name and `aka` synonyms. It uses, in order:

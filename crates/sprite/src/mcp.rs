@@ -195,7 +195,7 @@ fn tools() -> Vec<Tool> {
         t("export_gif", "Export GIF",
             "Renders a sprite as an animated GIF and returns it (plus a download URL when the server has a public address). \
              Uses the renderer's exact palette, so colours never shift and the background can be truly transparent. \
-             Timing comes from the sprite's ms and hold. Also saved to the library's _export folder.",
+             Timing comes from the sprite's ms and hold. With a write token, also saved to the library's _export folder.",
             obj(json!({
                 "name": name_schema(),
                 "scale": {"type": "integer", "minimum": 1, "maximum": 16, "description": "nearest-neighbour upscale (default 8 → 256px)"},
@@ -284,21 +284,36 @@ fn set_headline(res: &mut CallToolResult, head: &str) {
 }
 
 /// Who is calling and whether they may use the keyed tools: the token label (or "anon") under
-/// `sprite serve`, or a privileged "local" over stdio.
+/// `sprite serve`, or a privileged "local" over stdio. An HTTP request that somehow skipped the
+/// auth middleware is anonymous, never privileged.
 fn caller(ctx: &RequestContext<RoleServer>) -> (String, bool) {
-    ctx.extensions
-        .get::<axum::http::request::Parts>()
-        .and_then(|p| p.extensions.get::<crate::http::Caller>())
-        .map(|c| (c.label.clone(), c.privileged))
-        .unwrap_or_else(|| ("local".into(), true))
+    match ctx.extensions.get::<axum::http::request::Parts>() {
+        None => ("local".into(), true),
+        Some(p) => p.extensions.get::<crate::http::Caller>().map_or_else(|| ("anon".into(), false), |c| (c.label.clone(), c.privileged)),
+    }
+}
+
+/// How many sprites tokenless callers may create per hour, across all of them
+/// (SPRITE_ANON_CREATES_PER_HOUR, default 60). Keeps the public library and atlas from being flooded.
+fn anon_create_allowed() -> Result<(), String> {
+    static RECENT: Mutex<Vec<std::time::Instant>> = Mutex::new(Vec::new());
+    let limit: usize = std::env::var("SPRITE_ANON_CREATES_PER_HOUR").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
+    let hour = std::time::Duration::from_secs(3600);
+    let mut recent = RECENT.lock().unwrap();
+    recent.retain(|t| t.elapsed() < hour);
+    if recent.len() >= limit {
+        return Err(format!("Tokenless callers have created {limit} sprites in the last hour, the limit. Try later, or use a write token."));
+    }
+    recent.push(std::time::Instant::now());
+    Ok(())
 }
 
 impl SpriteServer {
-    /// Tools that change or delete an existing sprite, or spend API credits, need a write token.
-    /// Everything else (reading, rendering, exporting, creating a new sprite) is public.
-    pub(crate) fn keyed(tool: &str, args: &Map<String, Value>) -> bool {
-        matches!(tool, "edit_sprite" | "delete_sprite" | "restore_sprite" | "blind_review")
-            || (tool == "create_sprite" && args.get("overwrite").and_then(Value::as_bool).unwrap_or(false))
+    /// Tools that change or delete an existing sprite, spend API credits, or write export files
+    /// need a write token. Everything else (reading, rendering, export_gif, creating a new sprite)
+    /// is public; create_sprite itself refuses to replace or revive a sprite without one.
+    pub(crate) fn keyed(tool: &str) -> bool {
+        matches!(tool, "edit_sprite" | "delete_sprite" | "restore_sprite" | "blind_review" | "export_atlas")
     }
 
     fn path(&self, name: &str) -> PathBuf {
@@ -379,7 +394,7 @@ impl SpriteServer {
         Ok(CallToolResult::success(content))
     }
 
-    fn create_sprite(&self, a: &Map<String, Value>, who: &str) -> ToolOut {
+    fn create_sprite(&self, a: &Map<String, Value>, who: &str, privileged: bool) -> ToolOut {
         let name = arg_str(a, "name").unwrap_or_default();
         if !valid_name(name) {
             return Err("name must be lowercase snake_case, e.g. teddy_bear".into());
@@ -398,6 +413,17 @@ impl SpriteServer {
             });
         }
         let was_deleted = store::is_deleted(&self.lib, name);
+        // checked against what's on disk, not the overwrite flag: replacing a sprite is an edit, and
+        // bringing back a deleted name is a restore
+        if !privileged {
+            if on_disk.is_some() {
+                return Err(format!("Replacing \"{name}\" needs a write token sent as an Authorization: Bearer header. Pick a new name instead."));
+            }
+            if was_deleted {
+                return Err(format!("\"{name}\" was deleted; reusing its name needs a write token sent as an Authorization: Bearer header. Pick a new name instead."));
+            }
+            anon_create_allowed()?;
+        }
         let mut spec = Map::new();
         spec.insert("name".into(), json!(name));
         spec.insert("cat".into(), json!(cat));
@@ -542,7 +568,9 @@ impl SpriteServer {
         Ok(res)
     }
 
-    fn export_gif(&self, a: &Map<String, Value>) -> ToolOut {
+    /// Only privileged callers get a copy in _export; for everyone else the GIF is returned inline
+    /// and via the URL, so the public can't fill the disk or replace the owner's exports.
+    fn export_gif(&self, a: &Map<String, Value>, save: bool) -> ToolOut {
         let name = arg_str(a, "name").unwrap_or_default();
         let v = self.load(name)?;
         let (spec, frames) = render_spec(&v).map_err(|e| format!("\"{name}\" has an invalid spec:\n- {}", e.join("\n- ")))?;
@@ -561,10 +589,11 @@ impl SpriteServer {
         let durations: Vec<u32> = (0..frames.len()).map(|i| spec.frame_ms(i)).collect();
         let (gif, info) = imgio::gif(&frames, &durations, &opts).map_err(|e| e.to_string())?;
 
-        let dir = self.lib.join("_export");
-        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let path = dir.join(format!("{name}.gif"));
-        store::write_atomic(&path, &gif).map_err(|e| e.to_string())?;
+        if save {
+            let dir = self.lib.join("_export");
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            store::write_atomic(&dir.join(format!("{name}.gif")), &gif).map_err(|e| e.to_string())?;
+        }
 
         let mut lines = vec![format!(
             "GIF for \"{name}\": {side}×{side}px, {n} frame{s} ({src} rendered), {ms} ms per loop{bg}{pp}{rep}, {kb:.1} KB.",
@@ -598,7 +627,9 @@ impl SpriteServer {
                 q.join("&")
             ));
         }
-        lines.push(format!("Saved to _export/{name}.gif in the sprite library."));
+        if save {
+            lines.push(format!("Saved to _export/{name}.gif in the sprite library."));
+        }
         let mut content = vec![];
         if gif.len() <= MAX_INLINE_GIF {
             content.push(ContentBlock::image(base64::engine::general_purpose::STANDARD.encode(&gif), "image/gif"));
@@ -626,7 +657,7 @@ impl SpriteServer {
             return Err("No sprites matched.".into());
         }
         let base = arg_str(a, "file").unwrap_or("atlas");
-        if !base.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') || base.is_empty() {
+        if !base.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-') || base.is_empty() || base.len() > 40 {
             return Err("file must match ^[a-z0-9_-]{1,40}$".into());
         }
         let scale = a.get("scale").and_then(Value::as_u64).unwrap_or(1).clamp(1, 8) as usize;
@@ -867,10 +898,9 @@ impl ServerHandler for SpriteServer {
         let this = self.clone();
         let (who, privileged) = caller(&context);
         let name = request.name.to_string();
-        if !privileged && Self::keyed(&name, &args) {
-            let what = if name == "create_sprite" { "create_sprite with overwrite: true".to_string() } else { name.clone() };
+        if !privileged && Self::keyed(&name) {
             return Ok(CallToolResult::error(vec![text(format!(
-                "{what} needs a write token sent as an Authorization: Bearer header. Reading, rendering, exporting and \
+                "{name} needs a write token sent as an Authorization: Bearer header. Reading, rendering, export_gif and \
                  creating new sprites work without one."
             ))])
             .into());
@@ -892,10 +922,10 @@ impl ServerHandler for SpriteServer {
                     "list_sprites" => this.list_sprites(&args),
                     "delete_sprite" => this.delete_sprite(&args, &who),
                     "sprite_history" => this.sprite_history(&args),
-                    "create_sprite" => this.create_sprite(&args, &who),
+                    "create_sprite" => this.create_sprite(&args, &who, privileged),
                     "edit_sprite" => this.edit_sprite(&args, &who),
                     "restore_sprite" => this.restore_sprite(&args, &who),
-                    "export_gif" => this.export_gif(&args),
+                    "export_gif" => this.export_gif(&args, privileged),
                     "render_sprite" => {
                         let n = arg_str(&args, "name").unwrap_or_default();
                         let scale = args.get("scale").and_then(Value::as_u64).unwrap_or(8).clamp(1, 16) as usize;

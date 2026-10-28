@@ -92,7 +92,7 @@ For a prototype served from a dev origin that reads pixels (canvas), add that or
 | `GET /v1/sprites/{name}.sheet.png` | all frames in a row |
 | `GET /v1/sprites/{name}.json` | the spec |
 | `GET /v1/atlas.png`, `/v1/atlas.json` | `?category=`, `?names=a,b`, `?scale=1..8`, `?max=` (largest side in px, default 4096, up to 8192). `413` if the selection doesn't fit; filter it or lower the scale. Identical frames share a cell, so look frames up by key |
-| `POST /v1/render?format=png\|gif\|sheet\|json` | render a spec without saving (256 KB limit) |
+| `POST /v1/render?format=png\|gif\|sheet\|json` | render a spec without saving (256 KB limit). Send it with `Content-Type: application/json` (anything else is a `415`), so other sites' pages can't call it without passing `SPRITE_CORS` |
 
 Everything returns an `ETag`; send `If-None-Match` to get `304` when nothing changed.
 No REST route needs a token. Writes only happen through MCP.
@@ -101,13 +101,15 @@ No REST route needs a token. Writes only happen through MCP.
 | | no token | write token (bearer header) |
 |---|---|---|
 | REST: list, PNG, GIF, sheet, spec, atlas, `POST /v1/render` | ✓ | ✓ |
-| MCP: `style_guide`, `list_sprites`, `get_sprite`, `render_sprite`, `sprite_history`, `export_gif`, `export_atlas` | ✓ | ✓ |
-| MCP: `create_sprite` (new name) | ✓ | ✓ |
-| MCP: `create_sprite` with `overwrite: true`, `edit_sprite`, `delete_sprite`, `restore_sprite` | | ✓ |
-| MCP: `blind_review` (spends `ANTHROPIC_API_KEY` credits) | | ✓ |
+| MCP: `style_guide`, `list_sprites`, `get_sprite`, `render_sprite`, `sprite_history`, `export_gif` | ✓ | ✓ |
+| MCP: `create_sprite` with a name that has never been used (60 per hour across all tokenless callers; `SPRITE_ANON_CREATES_PER_HOUR`) | ✓ | ✓ |
+| MCP: `create_sprite` over an existing or deleted name, `edit_sprite`, `delete_sprite`, `restore_sprite` | | ✓ |
+| MCP: `export_atlas` (writes files; the REST atlas is public), `blind_review` (spends `ANTHROPIC_API_KEY` credits) | | ✓ |
 
-A token that doesn't match is a `401`, not a silent fall back to anonymous. History records who
-made each change: the token label, or `anon`.
+`export_gif` returns the GIF inline and as a URL for everyone, but only saves a copy in `_export/`
+for a write token. A token that doesn't match, or an `Authorization` header that isn't
+`Bearer <token>`, is a `401`, not a silent fall back to anonymous. History records who made each
+change: the token label, or `anon` (`anon` and `local` can't be used as token labels).
 
 ## Tokens
 `/etc/sprite/tokens` holds one `label:scope:token` per line. Give each person or prototype its own

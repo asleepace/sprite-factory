@@ -107,6 +107,10 @@ fn rest_auth_and_assets() {
     assert_eq!(req(&s.addr, "GET", "/v1/atlas.json", &[], b"").0, 200);
     assert_eq!(req(&s.addr, "GET", "/v1/sprites", &[("Authorization", "Bearer wrong")], b"").0, 401);
     assert_eq!(req(&s.addr, "GET", "/v1/sprites/apple.png?key=wrong", &[], b"").0, 401);
+    // a malformed Authorization header is a 401 too; the scheme is case-insensitive
+    assert_eq!(req(&s.addr, "GET", "/v1/sprites", &[("Authorization", &format!("Basic {TOKEN}"))], b"").0, 401);
+    assert_eq!(req(&s.addr, "GET", "/v1/sprites", &[("Authorization", TOKEN)], b"").0, 401);
+    assert_eq!(req(&s.addr, "GET", "/v1/sprites", &[("Authorization", &format!("bearer {TOKEN}"))], b"").0, 200);
 
     let (st, _, body) = req(&s.addr, "GET", "/v1/sprites", &[AUTH], b"");
     assert_eq!(st, 200);
@@ -165,11 +169,16 @@ fn rest_auth_and_assets() {
     }
     assert_eq!(req(&s.addr, "GET", "/v1/atlas.png", &[AUTH], b"").0, 200);
 
-    // ad-hoc render: errors are specific, success returns an image, nothing is saved
-    let (st, _, body) = req(&s.addr, "POST", "/v1/render?format=json", &[AUTH], br#"{"prims":[{"t":"blob"}]}"#);
+    // ad-hoc render: JSON bodies only (so cross-origin pages need a CORS preflight), errors are
+    // specific, success returns an image, nothing is saved
+    let star = br#"{"name":"tmp","anim":"spin","prims":[{"t":"star","c":[16,16],"r":12,"m":"gold"}]}"#;
+    assert_eq!(req(&s.addr, "POST", "/v1/render?format=gif", &[], star).0, 415);
+    assert_eq!(req(&s.addr, "POST", "/v1/render?format=gif", &[("Content-Type", "text/plain")], star).0, 415);
+    let json_ct = ("Content-Type", "application/json");
+    let (st, _, body) = req(&s.addr, "POST", "/v1/render?format=json", &[json_ct], br#"{"prims":[{"t":"blob"}]}"#);
     assert_eq!(st, 422);
     assert!(String::from_utf8_lossy(&body).contains("unknown type"));
-    let (st, head, _) = req(&s.addr, "POST", "/v1/render?format=gif", &[AUTH], br#"{"name":"tmp","anim":"spin","prims":[{"t":"star","c":[16,16],"r":12,"m":"gold"}]}"#);
+    let (st, head, _) = req(&s.addr, "POST", "/v1/render?format=gif", &[("Content-Type", "application/json; charset=utf-8")], star);
     assert_eq!((st, header(&head, "content-type")), (200, Some("image/gif")));
     assert!(!s.lib.join("tmp.json").exists());
 
@@ -223,6 +232,7 @@ async fn mcp_over_http_shares_the_library() {
             ("restore_sprite", json!({"name": "apple", "rev": 1})),
             ("blind_review", json!({"names": ["apple"]})),
             ("create_sprite", json!({"name": "apple", "category": "food", "overwrite": true, "prims": star})),
+            ("export_atlas", json!({})),
         ] {
             let r = c.call_tool(call(tool, args)).await.unwrap();
             assert_eq!(r.is_error, Some(true), "{who}: {tool} must need a write token");
@@ -230,11 +240,12 @@ async fn mcp_over_http_shares_the_library() {
         }
         c.cancel().await.unwrap();
     }
-    // none of the refused calls touched apple
+    // none of the refused calls touched apple, and public export_gif didn't write files
     let apple: Value = serde_json::from_slice(&std::fs::read(s.lib.join("apple.json")).unwrap()).unwrap();
     assert_eq!(apple["prims"][0]["m"], "red");
+    assert!(!s.lib.join("_export").exists());
 
-    let cfg = StreamableHttpClientTransportConfig::with_uri(url).auth_header(TOKEN);
+    let cfg = StreamableHttpClientTransportConfig::with_uri(url.clone()).auth_header(TOKEN);
     let client = ().serve(StreamableHttpClientTransport::from_config(cfg)).await.expect("connect with token");
     let tools = client.list_all_tools().await.unwrap();
     assert_eq!(tools.len(), 12);
@@ -252,7 +263,22 @@ async fn mcp_over_http_shares_the_library() {
     let hist = client.call_tool(h).await.unwrap();
     let txt: String = hist.content.iter().filter_map(|c| if let ContentBlock::Text(t) = c { Some(t.text.clone()) } else { None }).collect();
     assert!(txt.contains("create") && txt.contains("tester"), "{txt}");
+    let mut e = CallToolRequestParams::new("export_gif");
+    e.arguments = json!({"name": "moon"}).as_object().cloned();
+    assert_ne!(client.call_tool(e).await.unwrap().is_error, Some(true));
+    assert!(s.lib.join("_export/moon.gif").exists(), "a write token's export_gif is saved");
+
+    // once the owner deletes a sprite, the public can't bring the name back with create_sprite
+    let mut d = CallToolRequestParams::new("delete_sprite");
+    d.arguments = json!({"name": "star_anon"}).as_object().cloned();
+    assert_ne!(client.call_tool(d).await.unwrap().is_error, Some(true));
     client.cancel().await.unwrap();
+    let anon = ().serve(StreamableHttpClientTransport::from_config(StreamableHttpClientTransportConfig::with_uri(url.clone()))).await.unwrap();
+    let r = anon.call_tool(call("create_sprite", json!({"name": "star_anon", "category": "nature", "prims": star}))).await.unwrap();
+    assert_eq!(r.is_error, Some(true));
+    assert!(text_of(&r).contains("write token"), "{}", text_of(&r));
+    assert!(!s.lib.join("star_anon.json").exists());
+    anon.cancel().await.unwrap();
 
     // what the model just made is immediately available to prototypes over REST
     let (st, _, png) = req(&s.addr, "GET", "/v1/sprites/moon.png", &[AUTH], b"");

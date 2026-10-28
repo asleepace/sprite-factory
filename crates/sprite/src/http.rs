@@ -97,6 +97,9 @@ fn load_tokens(file: Option<&PathBuf>) -> Result<Vec<Token>> {
             }
             _ => bail!("token entries look like label:scope:token (got {} fields)", parts.len()),
         };
+        if label == "anon" || label == "local" {
+            bail!("token label {label:?} is reserved (history uses it for tokenless and stdio callers)");
+        }
         if secret.len() < 24 {
             bail!("token for {label:?} is too short (need ≥ 24 chars; try `openssl rand -hex 32`)");
         }
@@ -139,12 +142,17 @@ async fn auth(State(st): State<AppState>, mut req: Request, next: Next) -> Respo
     if req.uri().path() == "/healthz" || req.method() == Method::OPTIONS {
         return next.run(req).await;
     }
-    let from_header = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::to_string);
+    let unauthorized = || {
+        (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, "Bearer")], Json(json!({"error": "invalid token"}))).into_response()
+    };
+    // a header that's present but isn't `Bearer <token>` is a mistake, not a request to be anonymous
+    let from_header = match req.headers().get(header::AUTHORIZATION) {
+        None => None,
+        Some(v) => match v.to_str().ok().and_then(|v| v.split_once(' ')) {
+            Some((scheme, tok)) if scheme.eq_ignore_ascii_case("bearer") && !tok.trim().is_empty() => Some(tok.trim().to_string()),
+            _ => return unauthorized(),
+        },
+    };
     let via_header = from_header.is_some();
     let from_query = req.uri().query().and_then(|q| {
         q.split('&').find_map(|kv| kv.strip_prefix("key=").map(|v| v.to_string()))
@@ -153,10 +161,7 @@ async fn auth(State(st): State<AppState>, mut req: Request, next: Next) -> Respo
         None => Caller { label: "anon".into(), privileged: false },
         Some(p) => match st.tokens.iter().find(|t| ct_eq(t.secret.as_bytes(), p.as_bytes())) {
             Some(tok) => Caller { label: tok.label.clone(), privileged: tok.scope == Scope::Write && via_header },
-            None => {
-                return (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, "Bearer")], Json(json!({"error": "invalid token"})))
-                    .into_response()
-            }
+            None => return unauthorized(),
         },
     };
     req.extensions_mut().insert(caller);
@@ -435,7 +440,16 @@ async fn atlas(
 }
 
 /// POST /v1/render?format=png|gif|sheet|json&scale=N — render a spec without saving it.
-async fn render_adhoc(Query(q): Query<HashMap<String, String>>, body: Bytes) -> Result<Response, ApiError> {
+/// The body must be sent as application/json: that makes a cross-origin browser request preflight,
+/// so only --cors origins can make visitors' browsers spend render time here.
+async fn render_adhoc(Query(q): Query<HashMap<String, String>>, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
+    let is_json = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("application/json"));
+    if !is_json {
+        return Err(ApiError(StatusCode::UNSUPPORTED_MEDIA_TYPE, json!({"error": "send the spec with Content-Type: application/json"})));
+    }
     let v: Value = serde_json::from_slice(&body).map_err(|e| ApiError(StatusCode::BAD_REQUEST, json!({"error": format!("body is not JSON: {e}")})))?;
     let format = q.get("format").cloned().unwrap_or_else(|| "png".into());
     let scale = qnum(&q, "scale", if format == "gif" { 4 } else { 1 }, 1, 16);
